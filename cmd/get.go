@@ -52,7 +52,7 @@ func getRunE(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("--json requires --lease")
 	}
 
-	repoRoot, err := git.FindRepoRoot()
+	repoRoot, err := git.FindMainRepoRoot()
 	if err != nil {
 		return fmt.Errorf("not in a git repository: %w", err)
 	}
