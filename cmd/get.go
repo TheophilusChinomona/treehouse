@@ -56,6 +56,10 @@ func getRunE(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("not in a git repository: %w", err)
 	}
+	repoRoot, err = git.FindMainRepoRoot()
+	if err != nil {
+		return fmt.Errorf("not in a git repository: %w", err)
+	}
 
 	cfg, err := config.Load(repoRoot)
 	if err != nil {
