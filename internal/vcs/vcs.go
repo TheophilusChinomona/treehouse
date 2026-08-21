@@ -65,6 +65,20 @@ type Backend interface {
 	// ResetWorktree returns a worktree to a pristine checkout of branch,
 	// discarding local modifications.
 	ResetWorktree(worktreePath, branch string) error
+	// ResetWorktreeToRef resets worktreePath to an already resolved commit.
+	// Callers that verified safety must pass the reset target and worktree
+	// HEAD returned by IsWorktreeSafeToReset. The reset re-reads HEAD and,
+	// when requireClean is set, re-checks dirtiness under the exclusive
+	// lock before any destructive tree update, so concurrent uncommitted
+	// work is not discarded. Refuse if HEAD changed, the lock cannot be
+	// taken, or (when requireClean) the tree is dirty.
+	ResetWorktreeToRef(worktreePath, ref, expectedHead string, requireClean bool) error
+	// IsWorktreeSafeToReset reports whether worktreePath can be reset to
+	// branch without discarding committed work. It returns the immutable
+	// reset target and the worktree HEAD recorded at check time. Callers
+	// must pass both to ResetWorktreeToRef. The check fails closed when
+	// the target or HEAD cannot be resolved.
+	IsWorktreeSafeToReset(worktreePath, branch string) (bool, string, string, error)
 	// DetachWorktree releases any branch the worktree has checked out so
 	// pooled worktrees never hold branch names.
 	DetachWorktree(worktreePath string) error
@@ -269,6 +283,18 @@ func Fetch(repoRoot string) error { return backendFor(repoRoot).Fetch(repoRoot) 
 // ResetWorktree returns a worktree to a pristine checkout of branch.
 func ResetWorktree(worktreePath, branch string) error {
 	return backendFor(worktreePath).ResetWorktree(worktreePath, branch)
+}
+
+// ResetWorktreeToRef resets worktreePath to an already resolved commit.
+func ResetWorktreeToRef(worktreePath, ref, expectedHead string, requireClean bool) error {
+	return backendFor(worktreePath).ResetWorktreeToRef(worktreePath, ref, expectedHead, requireClean)
+}
+
+// IsWorktreeSafeToReset reports whether worktreePath can be reset to branch
+// without discarding committed work and returns the immutable reset target and
+// the worktree HEAD recorded at check time.
+func IsWorktreeSafeToReset(worktreePath, branch string) (bool, string, string, error) {
+	return backendFor(worktreePath).IsWorktreeSafeToReset(worktreePath, branch)
 }
 
 // DetachWorktree releases any branch the worktree has checked out.

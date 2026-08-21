@@ -3,6 +3,7 @@ package gitvcs
 import (
 	"bytes"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -198,19 +199,153 @@ func Fetch(repoRoot string) error {
 }
 
 func ResetWorktree(worktreePath, branch string) error {
+	ref, err := resolveResetRef(worktreePath, branch)
+	if err != nil {
+		return err
+	}
+	head, err := worktreeHead(worktreePath)
+	if err != nil {
+		return err
+	}
+	return ResetWorktreeToRef(worktreePath, ref, head, false)
+}
+
+// ResetWorktreeToRef resets worktreePath to an already resolved commit.
+// expectedHead is the worktree HEAD recorded at check time.
+//
+// The re-read and the destructive update run while holding git's own
+// HEAD.lock (O_CREAT|O_EXCL). Concurrent git processes that would change
+// HEAD (commit, checkout, merge, rebase) cannot create that lock, so they
+// cannot sneak a new commit in after the comparison. When requireClean is
+// set, dirtiness is re-checked under that lock before read-tree/clean, so
+// uncommitted file or index changes that landed after the caller's dirty
+// check are not overwritten. The worktree is updated with read-tree/clean,
+// which do not need HEAD.lock; HEAD itself is committed by renaming the
+// lock file onto HEAD, the same protocol git uses.
+func ResetWorktreeToRef(worktreePath, ref, expectedHead string, requireClean bool) error {
+	if !isCommitID(expectedHead) || !isCommitID(ref) {
+		return fmt.Errorf("worktree reset requires resolved commit IDs")
+	}
+	headPath, err := gitPath(worktreePath, "HEAD")
+	if err != nil {
+		return err
+	}
+	lockPath := headPath + ".lock"
+	lf, err := os.OpenFile(lockPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0666)
+	if err != nil {
+		return fmt.Errorf("cannot lock worktree HEAD: %w", err)
+	}
+	held := true
+	defer func() {
+		_ = lf.Close()
+		if held {
+			_ = os.Remove(lockPath)
+		}
+	}()
+
+	head, err := worktreeHead(worktreePath)
+	if err != nil {
+		return err
+	}
+	if head != expectedHead {
+		return fmt.Errorf("worktree HEAD changed since safety check: was %s, now %s", expectedHead, head)
+	}
+	if requireClean {
+		dirty, err := IsDirty(worktreePath)
+		if err != nil {
+			return err
+		}
+		if dirty {
+			return fmt.Errorf("worktree became dirty after safety check")
+		}
+	}
+
+	if _, err := runGit(worktreePath, "read-tree", "--reset", "-u", ref); err != nil {
+		return err
+	}
+	if _, err := runGit(worktreePath, "clean", "-fd"); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(lf, "%s\n", ref); err != nil {
+		return err
+	}
+	if err := lf.Sync(); err != nil {
+		return err
+	}
+	if err := lf.Close(); err != nil {
+		return err
+	}
+	if err := replaceFile(lockPath, headPath); err != nil {
+		return err
+	}
+	held = false
+	return nil
+}
+
+func resolveResetRef(worktreePath, branch string) (string, error) {
 	repoRoot, err := runGit(worktreePath, "rev-parse", "--show-toplevel")
 	if err != nil {
 		repoRoot = worktreePath
 	}
 	ref := branchRef(repoRoot, branch)
-	if _, err := runGit(worktreePath, "checkout", "--detach", "--force", ref); err != nil {
-		return err
+	return refCommit(worktreePath, ref)
+}
+
+func worktreeHead(worktreePath string) (string, error) {
+	return runGit(worktreePath, "rev-parse", "--verify", "HEAD^{commit}")
+}
+
+func gitPath(worktreePath, name string) (string, error) {
+	out, err := runGit(worktreePath, "rev-parse", "--path-format=absolute", "--git-path", name)
+	if err == nil {
+		return filepath.Clean(filepath.FromSlash(out)), nil
 	}
-	if _, err := runGit(worktreePath, "reset", "--hard", ref); err != nil {
-		return err
+	gitDir, dirErr := runGit(worktreePath, "rev-parse", "--absolute-git-dir")
+	if dirErr != nil {
+		return "", err
 	}
-	_, err = runGit(worktreePath, "clean", "-fd")
-	return err
+	rel, relErr := runGit(worktreePath, "rev-parse", "--git-path", name)
+	if relErr != nil {
+		return "", err
+	}
+	p := filepath.FromSlash(rel)
+	if !filepath.IsAbs(p) {
+		p = filepath.Join(filepath.FromSlash(gitDir), p)
+	}
+	return filepath.Clean(p), nil
+}
+
+func isCommitID(s string) bool {
+	n := len(s)
+	if n != 40 && n != 64 {
+		return false
+	}
+	for i := 0; i < n; i++ {
+		c := s[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// IsWorktreeSafeToReset reports whether worktreePath can be reset to branch
+// without discarding committed work and returns the immutable reset target and
+// the worktree HEAD recorded at check time. Callers must pass both to
+// ResetWorktreeToRef so verification and reset share one target and a later
+// HEAD change is refused. The check fails closed when the target or HEAD
+// cannot be resolved.
+func IsWorktreeSafeToReset(worktreePath, branch string) (bool, string, string, error) {
+	ref, err := resolveResetRef(worktreePath, branch)
+	if err != nil {
+		return false, "", "", err
+	}
+	head, err := worktreeHead(worktreePath)
+	if err != nil {
+		return false, "", "", err
+	}
+	safe, err := IsHeadMergedIntoRef(worktreePath, ref)
+	return safe, ref, head, err
 }
 
 func DetachWorktree(worktreePath string) error {
@@ -453,6 +588,12 @@ func (*Backend) RemoveCleanWorktree(repoRoot, path string) error {
 func (*Backend) Fetch(repoRoot string) error { return Fetch(repoRoot) }
 func (*Backend) ResetWorktree(worktreePath, branch string) error {
 	return ResetWorktree(worktreePath, branch)
+}
+func (*Backend) ResetWorktreeToRef(worktreePath, ref, expectedHead string, requireClean bool) error {
+	return ResetWorktreeToRef(worktreePath, ref, expectedHead, requireClean)
+}
+func (*Backend) IsWorktreeSafeToReset(worktreePath, branch string) (bool, string, string, error) {
+	return IsWorktreeSafeToReset(worktreePath, branch)
 }
 func (*Backend) DetachWorktree(worktreePath string) error { return DetachWorktree(worktreePath) }
 func (*Backend) DefaultBranchMergeRef(repoRoot string) (string, error) {

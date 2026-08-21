@@ -268,30 +268,169 @@ func (b *Backend) Fetch(repoRoot string) error {
 // of branch. The previous working-copy commit is abandoned, which discards
 // its changes from view while remaining recoverable via jj op restore.
 func (b *Backend) ResetWorktree(worktreePath, branch string) error {
+	ref, err := resolveResetRef(worktreePath, branch)
+	if err != nil {
+		return err
+	}
+	head, err := worktreeHead(worktreePath)
+	if err != nil {
+		return err
+	}
+	return b.ResetWorktreeToRef(worktreePath, ref, head, false)
+}
+
+// ResetWorktreeToRef resets worktreePath to an already resolved commit.
+// expectedHead is the working-copy commit recorded at check time.
+//
+// jj is lock-free: concurrent commands snapshot the operation log and always
+// commit, so no flock or private lock can exclude a parallel `jj commit`.
+// The destructive rewrite is therefore a single `jj rebase` whose revset is
+// `@ & commit_id(expectedHead)`. That command loads one snapshot, so a
+// concurrent change of @ makes the revset empty and the rebase a no-op. If
+// the workspace is then not parked on the reset target, the reset is refused
+// and the slot is skipped. When requireClean is set, dirtiness is re-checked
+// before rebase/abandon so uncommitted working-copy changes that landed after
+// the caller's dirty check are not discarded.
+func (b *Backend) ResetWorktreeToRef(worktreePath, ref, expectedHead string, requireClean bool) error {
 	// A sibling workspace may have moved the repo since this workspace was
 	// last used; recover first so the commands below see current state.
 	_, _ = runJJ(worktreePath, "workspace", "update-stale")
 
-	ref, err := branchRef(worktreePath, branch)
+	if !isCommitID(expectedHead) {
+		return fmt.Errorf("worktree reset requires a resolved working-copy commit")
+	}
+
+	revset := "@ & commit_id(\"" + expectedHead + "\")"
+	dirty, err := b.IsDirty(worktreePath)
 	if err != nil {
 		return err
 	}
-
-	// Skip the reset when the workspace is already clean and parked on ref.
-	dirty, err := b.IsDirty(worktreePath)
-	if err == nil && !dirty {
-		parent, perr := runJJ(worktreePath, "log", "-r", "@-", "--no-graph", "-T", `commit_id ++ "\n"`)
-		target, terr := runJJ(worktreePath, "log", "-r", ref, "--no-graph", "-T", `commit_id ++ "\n"`)
-		if perr == nil && terr == nil && parent != "" && parent == target {
-			return nil
+	if dirty {
+		if requireClean {
+			return fmt.Errorf("worktree became dirty after safety check")
 		}
+	} else {
+		if _, err := runJJ(worktreePath, "rebase", "-d", ref, "-r", revset); err != nil {
+			if parked, perr := b.parkedOnRef(worktreePath, ref); perr == nil && parked {
+				if head, herr := worktreeHead(worktreePath); herr == nil && head == expectedHead {
+					return nil
+				}
+			}
+			return err
+		}
+		parked, err := b.parkedOnRef(worktreePath, ref)
+		if err != nil {
+			return err
+		}
+		if !parked {
+			return fmt.Errorf("worktree HEAD changed since safety check: was %s", expectedHead)
+		}
+		return nil
 	}
 
-	if _, err := runJJ(worktreePath, "abandon", "-r", "@"); err != nil {
+	if _, err := runJJ(worktreePath, "abandon", "-r", revset); err != nil {
 		return err
+	}
+	if revsetNonEmpty(worktreePath, revset) {
+		return fmt.Errorf("worktree HEAD changed since safety check: was %s", expectedHead)
+	}
+	dirty, err = b.IsDirty(worktreePath)
+	if err != nil {
+		return err
+	}
+	if dirty {
+		return fmt.Errorf("worktree HEAD changed since safety check: was %s", expectedHead)
+	}
+	merged, err := b.IsHeadMergedIntoRef(worktreePath, ref)
+	if err != nil || !merged {
+		return fmt.Errorf("worktree HEAD changed since safety check: was %s", expectedHead)
 	}
 	_, err = runJJ(worktreePath, "new", ref)
 	return err
+}
+
+func (b *Backend) parkedOnRef(worktreePath, ref string) (bool, error) {
+	dirty, err := b.IsDirty(worktreePath)
+	if err != nil {
+		return false, err
+	}
+	if dirty {
+		return false, nil
+	}
+	parent, err := runJJ(worktreePath, "log", "-r", "@-", "--no-graph", "-T", `commit_id ++ "\n"`)
+	if err != nil {
+		return false, err
+	}
+	if i := strings.IndexByte(parent, '\n'); i >= 0 {
+		parent = parent[:i]
+	}
+	return parent != "" && parent == ref, nil
+}
+
+func isCommitID(s string) bool {
+	n := len(s)
+	if n != 40 && n != 64 {
+		return false
+	}
+	for i := 0; i < n; i++ {
+		c := s[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func resolveResetRef(worktreePath, branch string) (string, error) {
+	_, _ = runJJ(worktreePath, "workspace", "update-stale")
+	ref, err := branchRef(worktreePath, branch)
+	if err != nil {
+		return "", err
+	}
+	target, err := runJJ(worktreePath, "log", "-r", ref, "--no-graph", "-T", `commit_id ++ "\n"`)
+	if err != nil {
+		return "", err
+	}
+	if i := strings.IndexByte(target, '\n'); i >= 0 {
+		target = target[:i]
+	}
+	if target == "" {
+		return "", fmt.Errorf("cannot resolve %s to a commit", ref)
+	}
+	return target, nil
+}
+
+func worktreeHead(worktreePath string) (string, error) {
+	target, err := runJJ(worktreePath, "log", "-r", "@", "--no-graph", "-T", `commit_id ++ "\n"`)
+	if err != nil {
+		return "", err
+	}
+	if i := strings.IndexByte(target, '\n'); i >= 0 {
+		target = target[:i]
+	}
+	if target == "" {
+		return "", fmt.Errorf("cannot resolve working-copy commit")
+	}
+	return target, nil
+}
+
+// IsWorktreeSafeToReset reports whether worktreePath can be reset to branch
+// without discarding committed work and returns the immutable reset target and
+// the working-copy commit recorded at check time. Callers must pass both to
+// ResetWorktreeToRef so verification and reset share one target and a later
+// HEAD change is refused. The check fails closed when the target or HEAD
+// cannot be resolved.
+func (b *Backend) IsWorktreeSafeToReset(worktreePath, branch string) (bool, string, string, error) {
+	ref, err := resolveResetRef(worktreePath, branch)
+	if err != nil {
+		return false, "", "", err
+	}
+	head, err := worktreeHead(worktreePath)
+	if err != nil {
+		return false, "", "", err
+	}
+	safe, err := b.IsHeadMergedIntoRef(worktreePath, ref)
+	return safe, ref, head, err
 }
 
 // DetachWorktree is a no-op: jj working copies are anonymous commits and

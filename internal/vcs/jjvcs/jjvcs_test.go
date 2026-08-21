@@ -272,6 +272,88 @@ func TestResetWorktreeDiscardsChanges(t *testing.T) {
 	}
 }
 
+func TestResetWorktreeToRefRefusesWhenHeadChanged(t *testing.T) {
+	requireJJ(t)
+	repoDir := newLocalRepo(t)
+	wtPath := addWorkspace(t, repoDir)
+
+	b := New()
+	safe, resetRef, head, err := b.IsWorktreeSafeToReset(wtPath, "main")
+	if err != nil {
+		t.Fatalf("IsWorktreeSafeToReset: %v", err)
+	}
+	if !safe {
+		t.Fatal("expected fresh workspace to be safe to reset")
+	}
+
+	// Concurrent committed work after the safety check: @ is no longer the
+	// working-copy commit whose ancestry was verified, so the reset must refuse.
+	writeFile(t, filepath.Join(wtPath, "unlanded.txt"), "keep\n")
+	mustJJ(t, wtPath, "commit", "-m", "unlanded after check")
+	changed, err := worktreeHead(wtPath)
+	if err != nil {
+		t.Fatalf("resolve changed HEAD: %v", err)
+	}
+	if changed == head {
+		t.Fatal("expected working-copy commit to change after the concurrent commit")
+	}
+
+	if err := b.ResetWorktreeToRef(wtPath, resetRef, head, true); err == nil {
+		t.Fatal("expected ResetWorktreeToRef to refuse after HEAD changed")
+	}
+	got, err := worktreeHead(wtPath)
+	if err != nil {
+		t.Fatalf("resolve preserved HEAD: %v", err)
+	}
+	if got != changed {
+		t.Fatalf("expected unlanded HEAD %s preserved, got %s", changed, got)
+	}
+	if _, err := os.Stat(filepath.Join(wtPath, "unlanded.txt")); err != nil {
+		t.Fatalf("expected concurrent commit preserved on disk: %v", err)
+	}
+}
+
+func TestResetWorktreeToRefRefusesWhenDirtyAfterSafetyCheck(t *testing.T) {
+	requireJJ(t)
+	repoDir := newLocalRepo(t)
+	wtPath := addWorkspace(t, repoDir)
+
+	b := New()
+	safe, resetRef, head, err := b.IsWorktreeSafeToReset(wtPath, "main")
+	if err != nil {
+		t.Fatalf("IsWorktreeSafeToReset: %v", err)
+	}
+	if !safe {
+		t.Fatal("expected fresh workspace to be safe to reset")
+	}
+
+	scratch := filepath.Join(wtPath, "scratch.txt")
+	writeFile(t, scratch, "keep\n")
+
+	err = b.ResetWorktreeToRef(wtPath, resetRef, head, true)
+	if err == nil {
+		t.Fatal("expected ResetWorktreeToRef to refuse after the tree became dirty")
+	}
+	if !strings.Contains(err.Error(), "became dirty after safety check") {
+		t.Fatalf("expected dirty-after-check error, got %v", err)
+	}
+
+	got, err := worktreeHead(wtPath)
+	if err != nil {
+		t.Fatalf("resolve preserved HEAD: %v", err)
+	}
+	if got != head {
+		t.Fatalf("expected HEAD %s preserved, got %s", head, got)
+	}
+	contents, err := os.ReadFile(scratch)
+	if err != nil {
+		t.Fatalf("expected concurrent uncommitted work preserved on disk: %v", err)
+	}
+	if string(contents) != "keep\n" {
+		t.Fatalf("expected scratch contents preserved, got %q", contents)
+	}
+}
+
 func TestIsHeadMergedIntoRef(t *testing.T) {
 	requireJJ(t)
 	repoDir := newLocalRepo(t)
