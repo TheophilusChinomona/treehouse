@@ -257,9 +257,9 @@ Bulk `destroy --all` and prune leave recovered entries alone.
 By default, it lists stale idle managed worktrees that would be deleted and shows the reclaimable disk space.
 Pass `treehouse prune --yes` to delete those worktrees.
 
-By default, prune only inspects the current repository's pool and must be run inside a git repo.
+By default, prune only inspects the current repository's pool and must be run inside a repository.
 Pass `treehouse prune --all` or `treehouse prune --global` to inspect every managed pool under the user-level treehouse root from any directory.
-Global prune reads the user-level config and hooks, derives each worktree's owning repository from git metadata, then fetches and checks merge safety against that repository.
+Global prune reads the user-level config and hooks, derives each worktree's owning repository from version-control metadata, then fetches and checks merge safety against that repository.
 Without `--prune-orphans`, pass `treehouse prune --all --yes` to delete only the globally safe stale candidates.
 
 Prune ignores worktrees that are currently in use, leased, or reserved by another lifecycle operation.
@@ -329,11 +329,42 @@ max_trees = 16
 # Use "." to keep the pool inside the project (see "In-project storage" below).
 # Use an absolute user-level root for treehouse prune --all.
 # root = "$HOME/worktrees"
+
+# Optional version-control backend. Git is the default everywhere; set "jj"
+# to opt in to the experimental Jujutsu backend
+# (see "Version-control backend" below).
+# vcs = "jj"
 ```
 
 The repo-level config takes precedence for repo-safe settings.
 `treehouse prune --all` can run without a repository, so it uses only the user-level config and does not read per-repo `treehouse.toml` files while sweeping.
 If no config is found, the default pool size is 16.
+
+### Version-control backend (git or Jujutsu)
+
+Treehouse works in git and [Jujutsu (jj)](https://github.com/jj-vcs/jj) repositories.
+**The jj backend is experimental**: it is newer than the git backend and has seen far less production use, so treat it accordingly and report issues.
+In a jj repository, pooled worktrees are [jj workspaces](https://jj-vcs.github.io/jj/latest/working-copy/#workspaces) instead of git worktrees; the pool, lease, and safety machinery is identical.
+
+Git is the default backend everywhere, including in colocated repositories (both `.jj` and `.git`) and `.jj`-only repositories.
+Opt in to the jj backend with `vcs = "jj"`, resolved in this precedence (highest first): the `TREEHOUSE_VCS` environment variable, the repo-level `treehouse.toml`, the user-level `~/.config/treehouse/config.toml`.
+The jj opt-in only applies where a `.jj` directory actually exists; in a plain git repository it is silently ignored and git is used, so a shell-wide `TREEHOUSE_VCS=jj` never breaks git-only repositories.
+Pooled jj workspaces inherit the opt-in from their main repository root, so an untracked `treehouse.toml` there is enough.
+
+The backend is resolved on every command, and existing pool slots keep the flavor they were created with: changing the opt-in does not convert worktrees already in the pool.
+`destroy` and `prune` handle each slot by its own flavor (its `.git` or `.jj` marker), so a git worktree is still cleanly deregistered from git even after opting the repository into jj, and vice versa.
+`treehouse get`, however, is not yet flavor-aware: it may reset and hand back an existing slot of the old flavor until the pool is migrated, so a repo freshly opted into jj can still serve git worktrees from its old pool.
+To migrate a pool after changing the opt-in, `treehouse destroy` the old slots and re-acquire them with `treehouse get`.
+Acquire-side flavor awareness and first-class mixed git+jj pools are deferred to a follow-up.
+
+jj-backend notes:
+
+- Pooled worktrees are jj workspaces and are not colocated: they contain `.jj` but no `.git`, so run jj commands (not git) inside them.
+- A worktree is considered dirty when its working-copy commit `@` is non-empty or has a description.
+- Resets abandon only the working-copy commit and are recoverable with `jj op restore`.
+- Merge detection uses ancestry; squash-merged work is treated as unmerged, so lifecycle commands err on the side of keeping it.
+- The default branch resolves to the `main`/`master`/`trunk` bookmark, preferring origin.
+- Known limitation: a pooled jj workspace whose backing repository was deleted is not classified as an orphan; it is skipped as unverified and never auto-reclaimed by `prune --prune-orphans`. Reclaim it with `treehouse destroy`.
 
 ### Worktree root
 
