@@ -317,6 +317,21 @@ func planPrune(entries []WorktreeEntry, resolveContext pruneContextResolver, opt
 	return plan, nil
 }
 
+// mergeRefForWorktree returns the ref the merged-into-default check should
+// compare against for one worktree. The pool-level ref is in the configured
+// backend's vocabulary; a slot of the other flavor re-resolves the ref through
+// its own backend against the same repository root, so landed work in an
+// old-flavor slot still verifies (and the pool migrates) instead of reading as
+// unverifiable forever. A resolution failure surfaces as an error and callers
+// classify the worktree as cannot-verify, never as disposable.
+func mergeRefForWorktree(worktreePath string, context pruneContext) (string, error) {
+	flavor := vcs.WorktreeBackendName(worktreePath)
+	if flavor == "" || context.RepoRoot == "" || flavor == vcs.BackendNameFor(context.RepoRoot) {
+		return context.DefaultRef, nil
+	}
+	return vcs.DefaultBranchMergeRefForWorktree(worktreePath, context.RepoRoot)
+}
+
 func resolvePruneDefaultRef(repoRoot string) (string, error) {
 	if err := vcs.Fetch(repoRoot); err != nil {
 		return "", pruneVerificationError{
@@ -329,7 +344,7 @@ func resolvePruneDefaultRef(repoRoot string) (string, error) {
 	if err != nil {
 		category := pruneSkipCannotVerify
 		reason := "cannot resolve default branch"
-		if vcs.HasRemote(repoRoot, "origin") && isOriginAccessError(err) {
+		if vcs.HasRemote(repoRoot, "origin") && vcs.IsOriginAccessError(err) {
 			category = PruneSkipOriginUnreachable
 			reason = "cannot resolve origin default branch"
 		} else if vcs.HasRemote(repoRoot, "origin") {
@@ -479,7 +494,7 @@ func executePrune(poolDir string, plan prunePlan, options PruneOptions) (PruneRe
 			if plannedWorktree.Worktree.Orphaned {
 				worktree, skipped = finalOrphanPruneSafetyCheck(state.Worktrees[idx])
 			} else {
-				worktree, skipped = finalPruneSafetyCheck(context.DefaultRef, state.Worktrees[idx])
+				worktree, skipped = finalPruneSafetyCheck(context, state.Worktrees[idx])
 			}
 			if skipped.Reason != "" {
 				clearReservation(&state.Worktrees[idx])
@@ -562,7 +577,7 @@ func analyzePruneCandidate(resolveContext pruneContextResolver, wt WorktreeEntry
 	return analyzeIdleWorktree(resolveContext, wt, worktree, skipped, options)
 }
 
-func finalPruneSafetyCheck(defaultRef string, wt WorktreeEntry) (PruneWorktree, PruneSkipped) {
+func finalPruneSafetyCheck(context pruneContext, wt WorktreeEntry) (PruneWorktree, PruneSkipped) {
 	worktree := PruneWorktree{Name: wt.Name, Path: wt.Path}
 	skipped := PruneSkipped{Name: wt.Name, Path: wt.Path}
 
@@ -575,7 +590,6 @@ func finalPruneSafetyCheck(defaultRef string, wt WorktreeEntry) (PruneWorktree, 
 		skipped = newPruneSkipped(wt.Name, wt.Path, pruneSkipInUse, pruneSkipInUse, "")
 		return worktree, skipped
 	}
-	context := pruneContext{DefaultRef: defaultRef}
 	worktree, skipped, _, _, err = analyzeIdleWorktree(fixedPruneContextResolver(context), wt, worktree, skipped, PruneOptions{})
 	if err != nil {
 		skipped = newPruneSkipped(wt.Name, wt.Path, pruneSkipCannotVerify, "cannot prove HEAD is merged into default branch", err.Error())
@@ -618,6 +632,15 @@ func finalOrphanPruneSafetyCheck(wt WorktreeEntry) (PruneWorktree, PruneSkipped)
 }
 
 func analyzeIdleWorktree(resolveContext pruneContextResolver, wt WorktreeEntry, worktree PruneWorktree, skipped PruneSkipped, options PruneOptions) (PruneWorktree, PruneSkipped, bool, pruneContext, error) {
+	// A markerless slot (its .git/.jj marker is gone) must never have its
+	// facts read through the configured-backend fallback: in an in-project
+	// pool that resolves the repository ENCLOSING the pool, and a clean
+	// enclosing repository would label the damaged slot disposable.
+	if vcs.WorktreeBackendName(worktree.Path) == "" {
+		skipped = newPruneSkipped(wt.Name, wt.Path, pruneSkipCannotVerify, "no .git or .jj marker", "the slot's VCS marker is missing; remove it with 'treehouse destroy "+wt.Path+" --include-unlanded'")
+		return worktree, skipped, true, pruneContext{}, nil
+	}
+
 	if orphaned, detail := backingRepositoryMissing(worktree.Path); orphaned {
 		if !options.PruneOrphans {
 			skipped = newPruneSkipped(wt.Name, wt.Path, PruneSkipOrphanedBackingRepo, pruneOrphanUnverifiedWarning, detail)
@@ -660,7 +683,12 @@ func analyzeIdleWorktree(resolveContext pruneContextResolver, wt WorktreeEntry, 
 		return worktree, skipped, true, pruneContext{}, nil
 	}
 
-	merged, err := vcs.IsHeadMergedIntoRef(worktree.Path, context.DefaultRef)
+	ref, err := mergeRefForWorktree(worktree.Path, context)
+	if err != nil {
+		skipped = newPruneSkipped(wt.Name, wt.Path, pruneSkipCannotVerify, "cannot resolve default branch in the worktree's own backend", err.Error())
+		return worktree, skipped, true, context, nil
+	}
+	merged, err := vcs.IsHeadMergedIntoRef(worktree.Path, ref)
 	if err != nil {
 		if orphaned, detail := backingRepositoryMissing(worktree.Path); orphaned {
 			skipped = newPruneSkipped(wt.Name, wt.Path, PruneSkipOrphanedBackingRepo, pruneOrphanUnverifiedWarning, detail)
@@ -670,7 +698,7 @@ func analyzeIdleWorktree(resolveContext pruneContextResolver, wt WorktreeEntry, 
 		return worktree, skipped, true, context, nil
 	}
 	if !merged {
-		skipped = newPruneSkipped(wt.Name, wt.Path, PruneSkipUnmerged, fmt.Sprintf("HEAD not merged into %s", context.DefaultRef), "")
+		skipped = newPruneSkipped(wt.Name, wt.Path, PruneSkipUnmerged, fmt.Sprintf("HEAD not merged into %s", ref), "")
 		return worktree, skipped, true, context, nil
 	}
 
@@ -706,14 +734,6 @@ func skippedFromVerificationError(name, path string, err error) PruneSkipped {
 	return newPruneSkipped(name, path, pruneSkipCannotVerify, "cannot verify worktree", err.Error())
 }
 
-func isOriginAccessError(err error) bool {
-	detail := err.Error()
-	return strings.Contains(detail, "git ls-remote") ||
-		strings.Contains(detail, "Could not read from remote repository") ||
-		strings.Contains(detail, "does not appear to be a git repository") ||
-		strings.Contains(detail, "repository") && strings.Contains(detail, "not found")
-}
-
 func newPruneSkipped(name, path, category, reason, detail string) PruneSkipped {
 	if category == "" {
 		category = pruneSkipCannotVerify
@@ -731,17 +751,62 @@ func newPruneSkipped(name, path, category, reason, detail string) PruneSkipped {
 }
 
 func backingRepositoryMissing(worktreePath string) (bool, string) {
-	gitDir, ok, detail := linkedWorktreeGitDir(worktreePath)
-	if !ok {
-		return false, detail
+	gitDir, gitOK, gitDetail := linkedWorktreeGitDir(worktreePath)
+	if gitOK {
+		return pointerTargetMissing(gitDir, "gitdir")
 	}
-	if _, err := os.Stat(gitDir); err == nil {
+	storePath, jjOK, jjDetail := jjWorkspaceStorePointer(worktreePath)
+	if jjOK {
+		return pointerTargetMissing(storePath, "jj store")
+	}
+	// When neither route yields a pointer, report the diagnostic for the
+	// marker the worktree actually carries: a jj slot with a corrupt .jj/repo
+	// pointer should name the jj problem, not the absent .git file.
+	if info, err := os.Stat(filepath.Join(worktreePath, ".jj")); err == nil && info.IsDir() && jjDetail != "" {
+		return false, jjDetail
+	}
+	return false, gitDetail
+}
+
+// pointerTargetMissing reports whether the backing path a worktree points at
+// is gone, in a form both backends share.
+func pointerTargetMissing(target, kind string) (bool, string) {
+	if _, err := os.Stat(target); err == nil {
 		return false, ""
 	} else if os.IsNotExist(err) {
-		return true, fmt.Sprintf("gitdir %s does not exist", gitDir)
+		return true, fmt.Sprintf("%s %s does not exist", kind, target)
 	} else {
-		return false, fmt.Sprintf("cannot inspect gitdir %s: %v", gitDir, err)
+		return false, fmt.Sprintf("cannot inspect %s %s: %v", kind, target, err)
 	}
+}
+
+// jjWorkspaceStorePointer resolves a pooled jj workspace's .jj/repo pointer
+// file to the backing store path it names, mirroring linkedWorktreeGitDir
+// for the jj shape so a workspace whose backing repository was deleted can
+// classify as an orphan instead of an unverifiable skip forever. A .jj/repo
+// DIRECTORY means the store lives here (a main workspace, not a pooled
+// slot), which is not a linked worktree.
+func jjWorkspaceStorePointer(worktreePath string) (string, bool, string) {
+	repoPath := filepath.Join(worktreePath, ".jj", "repo")
+	info, err := os.Stat(repoPath)
+	if err != nil {
+		return "", false, err.Error()
+	}
+	if info.IsDir() {
+		return "", false, ""
+	}
+	data, err := os.ReadFile(repoPath)
+	if err != nil {
+		return "", false, err.Error()
+	}
+	storePath := strings.TrimSpace(string(data))
+	if storePath == "" {
+		return "", false, fmt.Sprintf("%s has an empty store pointer", repoPath)
+	}
+	if !filepath.IsAbs(storePath) {
+		storePath = filepath.Join(worktreePath, ".jj", storePath)
+	}
+	return filepath.Clean(storePath), true, ""
 }
 
 func linkedWorktreeGitDir(worktreePath string) (string, bool, string) {

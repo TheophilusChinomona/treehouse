@@ -27,6 +27,7 @@ type statusJSONWorktree struct {
 	Name        string              `json:"name"`
 	Path        string              `json:"path"`
 	Status      string              `json:"status"`
+	Flavor      string              `json:"flavor,omitempty"`
 	LeaseID     string              `json:"lease_id"`
 	LeaseHolder string              `json:"lease_holder"`
 	LeasedAt    *time.Time          `json:"leased_at"`
@@ -56,6 +57,7 @@ var statusCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
+		repoFlavor := vcs.BackendNameFor(repoRoot)
 
 		if statusJSON {
 			return writeStatusJSON(worktrees)
@@ -88,6 +90,8 @@ var statusCmd = &cobra.Command{
 				status = magenta(wt.Status)
 			case pool.StatusHere:
 				status = cyan(wt.Status)
+			case pool.StatusDamaged:
+				status = red(wt.Status)
 			}
 
 			// "%-4s  %-11s  " = 4 + 2 + 11 + 2 = 19 chars before path
@@ -95,6 +99,12 @@ var statusCmd = &cobra.Command{
 			line := fmt.Sprintf("%-4s  %s%s  %s", wt.Name, status, statusPad, ui.PrettyPath(wt.Path))
 			if wt.Status == pool.StatusLeased && wt.LeaseHolder != "" {
 				line += fmt.Sprintf("  (held by %s)", wt.LeaseHolder)
+			}
+			if wt.Flavor != "" && wt.Flavor != repoFlavor {
+				line += yellow(fmt.Sprintf("  (%s-flavored; repo selects %s — destroy to migrate)", wt.Flavor, repoFlavor))
+			}
+			if wt.Status == pool.StatusDamaged {
+				line += yellow(fmt.Sprintf("  (no .git or .jj marker — 'treehouse destroy %s --include-unlanded' to remove)", ui.PrettyPath(wt.Path)))
 			}
 			fmt.Fprintln(os.Stdout, line)
 
@@ -122,6 +132,7 @@ func writeStatusJSON(worktrees []pool.WorktreeStatus) error {
 			Name:        wt.Name,
 			Path:        wt.Path,
 			Status:      wt.Status,
+			Flavor:      wt.Flavor,
 			LeaseID:     wt.LeaseID,
 			LeaseHolder: wt.LeaseHolder,
 			Processes:   make([]statusJSONProcess, 0, len(wt.Processes)),

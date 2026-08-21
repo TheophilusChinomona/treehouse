@@ -209,3 +209,113 @@ func TestJJDirtyWorktreeIsNotHandedOut(t *testing.T) {
 		t.Fatal("expected committed pooled work to survive the worktree reset")
 	}
 }
+
+// TestJJEnvOnlyOptInSlotCanBeReturned pins the release contract: a jj slot
+// acquired under an env-only opt-in (TREEHOUSE_VCS=jj, no config key) must
+// still be returnable once the variable is gone, because every step of the
+// release path - root discovery, default branch, reset - dispatches on the
+// slot's own flavor.
+func TestJJEnvOnlyOptInSlotCanBeReturned(t *testing.T) {
+	requireJJ(t)
+	repoDir, homeDir := setupColocatedRepoWithoutOptIn(t)
+
+	stdout, stderr, exitCode := runTreehouse(t, repoDir, homeDir, []string{"TREEHOUSE_VCS=jj"}, "get", "--lease")
+	if exitCode != 0 {
+		t.Fatalf("get --lease under TREEHOUSE_VCS=jj: exit %d: %s", exitCode, stderr)
+	}
+	slot := strings.TrimSpace(stdout)
+	if _, err := os.Stat(filepath.Join(slot, ".jj")); err != nil {
+		t.Fatalf("expected a jj workspace under the env opt-in: %v", err)
+	}
+
+	// The env var is gone and no config names jj: the slot's own marker must
+	// still route the release through the jj backend.
+	_, stderr, exitCode = runTreehouse(t, repoDir, homeDir, nil, "return", slot)
+	if exitCode != 0 {
+		t.Fatalf("return without the opt-in visible: exit %d: %s", exitCode, stderr)
+	}
+}
+
+// TestDestroyMigratesOldFlavorSlots pins the migration story: a clean, merged
+// git slot left over from before a jj opt-in verifies through its own
+// backend's ref vocabulary, so a bare 'destroy --all --yes' removes it -
+// landed work never needs --include-unlanded.
+func TestDestroyMigratesOldFlavorSlots(t *testing.T) {
+	requireJJ(t)
+	repoDir, homeDir := setupColocatedRepoWithoutOptIn(t)
+
+	stdout, stderr, exitCode := runTreehouse(t, repoDir, homeDir, nil, "get", "--lease")
+	if exitCode != 0 {
+		t.Fatalf("get --lease (git): exit %d: %s", exitCode, stderr)
+	}
+	gitSlot := strings.TrimSpace(stdout)
+	if _, _, exitCode = runTreehouse(t, repoDir, homeDir, nil, "return", gitSlot); exitCode != 0 {
+		t.Fatal("returning the git slot failed")
+	}
+
+	if err := os.WriteFile(filepath.Join(repoDir, "treehouse.toml"), []byte("vcs = \"jj\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout, stderr, exitCode = runTreehouse(t, repoDir, homeDir, nil, "destroy", ".", "--all", "--yes")
+	if exitCode != 0 {
+		t.Fatalf("destroy --all --yes: exit %d: %s", exitCode, stderr)
+	}
+	if !strings.Contains(stdout, "Destroyed 1") {
+		t.Fatalf("expected the old git slot to be destroyed for migration, got: %s", stdout)
+	}
+	if _, err := os.Stat(gitSlot); !os.IsNotExist(err) {
+		t.Fatalf("expected the git slot gone from disk, got err %v", err)
+	}
+}
+
+// TestAcquireIsFlavorAware pins the acquire contract after an opt-in change:
+// a repository freshly opted in to jj must not be handed its old git slot -
+// a worktree where jj commands do not work - and the old slot must survive
+// untouched for the documented destroy-and-reacquire migration.
+func TestAcquireIsFlavorAware(t *testing.T) {
+	requireJJ(t)
+	repoDir, homeDir := setupColocatedRepoWithoutOptIn(t)
+
+	// Day 1: no opt-in - a git slot is created, used, and returned.
+	stdout, stderr, exitCode := runTreehouse(t, repoDir, homeDir, nil, "get", "--lease")
+	if exitCode != 0 {
+		t.Fatalf("get --lease (git): exit %d: %s", exitCode, stderr)
+	}
+	gitSlot := strings.TrimSpace(stdout)
+	if _, err := os.Stat(filepath.Join(gitSlot, ".git")); err != nil {
+		t.Fatalf("expected a git worktree on day 1: %v", err)
+	}
+	if _, _, exitCode = runTreehouse(t, repoDir, homeDir, nil, "return", gitSlot); exitCode != 0 {
+		t.Fatal("returning the git slot failed")
+	}
+
+	// Day 2: the repository opts in to jj. The same command must skip the
+	// available git slot and hand out a new jj workspace.
+	if err := os.WriteFile(filepath.Join(repoDir, "treehouse.toml"), []byte("vcs = \"jj\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stdout, stderr, exitCode = runTreehouse(t, repoDir, homeDir, nil, "get", "--lease")
+	if exitCode != 0 {
+		t.Fatalf("get --lease (jj): exit %d: %s", exitCode, stderr)
+	}
+	jjSlot := strings.TrimSpace(stdout)
+	if jjSlot == gitSlot {
+		t.Fatal("acquire handed the git slot to a jj-opted caller")
+	}
+	if _, err := os.Stat(filepath.Join(jjSlot, ".jj")); err != nil {
+		t.Fatalf("expected a jj workspace on day 2: %v", err)
+	}
+
+	// The old git slot is intact and visible: status names its flavor.
+	if _, err := os.Stat(filepath.Join(gitSlot, ".git")); err != nil {
+		t.Fatalf("the git slot must survive untouched for migration: %v", err)
+	}
+	stdout, _, exitCode = runTreehouse(t, repoDir, homeDir, nil, "status", "--json")
+	if exitCode != 0 {
+		t.Fatal("status --json failed")
+	}
+	if !strings.Contains(stdout, `"flavor":"git"`) || !strings.Contains(stdout, `"flavor":"jj"`) {
+		t.Fatalf("status --json must name both flavors, got: %s", stdout)
+	}
+}

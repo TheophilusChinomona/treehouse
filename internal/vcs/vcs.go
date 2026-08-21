@@ -15,6 +15,11 @@
 // an untracked config file, so they inherit the opt-in from their main
 // repository root, located by reading the .jj/repo pointer — file
 // inspection only; the decision still comes from explicit configuration.
+//
+// Operations on an existing worktree dispatch on the slot's own marker (a
+// .git entry or a .jj directory; see backendForWorktree), so the configured
+// backend never answers for a slot of the other flavor. Worktree creation
+// and paths without a marker still follow the configured backend.
 package vcs
 
 import (
@@ -22,6 +27,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"github.com/BurntSushi/toml"
 
@@ -176,7 +182,7 @@ func findMarkerRoot(dir string) (root string, hasJJ, hasGit bool) {
 // ~/.config/treehouse/config.toml. The files are read directly here (rather
 // than through internal/config) because config depends on this package.
 func vcsOverride(repoRoot string) string {
-	if v := normalizeVCSName(os.Getenv("TREEHOUSE_VCS")); v != "" {
+	if v := normalizeVCSNameFrom("TREEHOUSE_VCS", os.Getenv("TREEHOUSE_VCS")); v != "" {
 		return v
 	}
 	if v := vcsFromFile(filepath.Join(repoRoot, "treehouse.toml")); v != "" {
@@ -195,13 +201,32 @@ func vcsFromFile(path string) string {
 	if _, err := toml.DecodeFile(path, &cfg); err != nil {
 		return ""
 	}
-	return normalizeVCSName(cfg.VCS)
+	return normalizeVCSNameFrom(path, cfg.VCS)
 }
 
 func normalizeVCSName(v string) string {
 	switch v {
 	case "git", "jj":
 		return v
+	}
+	return ""
+}
+
+// warnedVCSValues dedupes unrecognized-value warnings: backend selection
+// runs many times per command and the warning is for a human, once.
+var warnedVCSValues sync.Map
+
+// normalizeVCSNameFrom is normalizeVCSName plus a one-time stderr warning
+// naming the source, so a misconfigured opt-in ("Jujutsu", "JJ", a stray
+// space) surfaces instead of silently keeping the default. The value is
+// still ignored: a typo must not break every command in the repository, and
+// stdout stays clean for machine callers.
+func normalizeVCSNameFrom(source, v string) string {
+	if n := normalizeVCSName(v); n != "" || v == "" {
+		return n
+	}
+	if _, seen := warnedVCSValues.LoadOrStore(source+"\x00"+v, true); !seen {
+		fmt.Fprintf(os.Stderr, "treehouse: unrecognized vcs value %q in %s (expected \"git\" or \"jj\"); ignoring it\n", v, source)
 	}
 	return ""
 }
@@ -217,9 +242,11 @@ func FindRepoRootFrom(dir string) (string, error) { return backendFor(dir).FindR
 // directory, resolving linked worktrees back to their owning repository.
 func FindMainRepoRoot() (string, error) { return backendFor("").FindMainRepoRootFrom("") }
 
-// FindMainRepoRootFrom returns the main repository root for dir.
+// FindMainRepoRootFrom returns the main repository root for dir. When dir is
+// itself a worktree (it holds a VCS marker), its own flavor answers; for any
+// other directory the configured backend does, exactly as before.
 func FindMainRepoRootFrom(dir string) (string, error) {
-	return backendFor(dir).FindMainRepoRootFrom(dir)
+	return backendForWorktree(dir).FindMainRepoRootFrom(dir)
 }
 
 // GetDefaultBranch returns the repository's default branch name.
@@ -258,23 +285,58 @@ func RemoveCleanWorktree(repoRoot, path string) error {
 	return backendForRemoval(repoRoot, path).RemoveCleanWorktree(repoRoot, path)
 }
 
-// backendForRemoval dispatches removal on what the worktree actually is (its
-// own marker), not on the repository's configured backend. A pool can
-// legitimately hold slots of both flavors after an opt-in change, and routing
-// a git worktree through jj removal deletes its directory without
-// deregistering it from .git/worktrees (the reverse direction errors and
-// leaves the slot stranded). This is artifact-typed dispatch, not backend
-// selection: creating worktrees still follows the explicit opt-in. A missing
-// or empty path falls back to the repository's backend so error surfacing is
-// unchanged.
-func backendForRemoval(repoRoot, path string) Backend {
+// slotMarkerBackend reports the backend a worktree's own marker names: a
+// .git entry means a git worktree, a .jj directory means a jj workspace.
+// Pool slots hold exactly one of the two (jj workspaces are never
+// colocated), so the marker identifies what the slot actually is regardless
+// of the repository's configured backend.
+func slotMarkerBackend(path string) Backend {
 	if _, err := os.Stat(filepath.Join(path, ".git")); err == nil {
 		return gitBackend
 	}
 	if info, err := os.Stat(filepath.Join(path, ".jj")); err == nil && info.IsDir() {
 		return jjBackend
 	}
+	return nil
+}
+
+// backendForWorktree dispatches per-worktree operations - the facts that
+// gate destructive decisions (dirty, merged, main-root) and the actions on a
+// slot's own state (reset, detach) - on what the worktree actually is. The
+// configured backend must not answer for a slot of the other flavor: a
+// .jj-only slot inspected through git resolves the repository ENCLOSING the
+// pool, and with an in-project pool root a clean enclosing repo makes dirty
+// jj work classify as disposable. Paths without a marker (ordinary
+// directories inside a repository) keep the configured-backend resolution.
+func backendForWorktree(path string) Backend {
+	if b := slotMarkerBackend(path); b != nil {
+		return b
+	}
+	return backendFor(path)
+}
+
+// backendForRemoval dispatches removal the same way, but falls back to the
+// repository's backend when the path is already gone, so error surfacing and
+// stale-registration cleanup stay exactly as they were.
+func backendForRemoval(repoRoot, path string) Backend {
+	if b := slotMarkerBackend(path); b != nil {
+		return b
+	}
 	return backendFor(repoRoot)
+}
+
+// destructiveBackendForWorktree dispatches the operations that rewrite a
+// worktree's checkout (reset, detach). Unlike backendForWorktree it refuses a
+// path holding no .git or .jj marker instead of falling back to the
+// configured backend, which in an in-project pool would resolve — and rewrite
+// — the repository ENCLOSING the pool. Callers guard markerless slots first;
+// this refusal is defense in depth. Pool slots are the only callers of these
+// operations, so ordinary directories are unaffected.
+func destructiveBackendForWorktree(path string) (Backend, error) {
+	if b := slotMarkerBackend(path); b != nil {
+		return b, nil
+	}
+	return nil, fmt.Errorf("refusing to modify %s: it holds no .git or .jj marker", path)
 }
 
 // Fetch updates refs from origin when an origin remote exists.
@@ -282,24 +344,36 @@ func Fetch(repoRoot string) error { return backendFor(repoRoot).Fetch(repoRoot) 
 
 // ResetWorktree returns a worktree to a pristine checkout of branch.
 func ResetWorktree(worktreePath, branch string) error {
-	return backendFor(worktreePath).ResetWorktree(worktreePath, branch)
+	b, err := destructiveBackendForWorktree(worktreePath)
+	if err != nil {
+		return err
+	}
+	return b.ResetWorktree(worktreePath, branch)
 }
 
 // ResetWorktreeToRef resets worktreePath to an already resolved commit.
 func ResetWorktreeToRef(worktreePath, ref, expectedHead string, requireClean bool) error {
-	return backendFor(worktreePath).ResetWorktreeToRef(worktreePath, ref, expectedHead, requireClean)
+	b, err := destructiveBackendForWorktree(worktreePath)
+	if err != nil {
+		return err
+	}
+	return b.ResetWorktreeToRef(worktreePath, ref, expectedHead, requireClean)
 }
 
 // IsWorktreeSafeToReset reports whether worktreePath can be reset to branch
 // without discarding committed work and returns the immutable reset target and
 // the worktree HEAD recorded at check time.
 func IsWorktreeSafeToReset(worktreePath, branch string) (bool, string, string, error) {
-	return backendFor(worktreePath).IsWorktreeSafeToReset(worktreePath, branch)
+	return backendForWorktree(worktreePath).IsWorktreeSafeToReset(worktreePath, branch)
 }
 
 // DetachWorktree releases any branch the worktree has checked out.
 func DetachWorktree(worktreePath string) error {
-	return backendFor(worktreePath).DetachWorktree(worktreePath)
+	b, err := destructiveBackendForWorktree(worktreePath)
+	if err != nil {
+		return err
+	}
+	return b.DetachWorktree(worktreePath)
 }
 
 // DefaultBranchMergeRef returns the fully qualified ref merge-safety checks
@@ -308,15 +382,38 @@ func DefaultBranchMergeRef(repoRoot string) (string, error) {
 	return backendFor(repoRoot).DefaultBranchMergeRef(repoRoot)
 }
 
+// DefaultBranchMergeRefForWorktree returns the merge ref in the vocabulary of
+// the worktree's own backend, resolved against repoRoot. A slot of the other
+// flavor came from an era when its backend worked against this repository, so
+// that backend can still name the ref merge-safety checks should compare
+// against; the configured backend's ref never parses for it.
+func DefaultBranchMergeRefForWorktree(worktreePath, repoRoot string) (string, error) {
+	return backendForWorktree(worktreePath).DefaultBranchMergeRef(repoRoot)
+}
+
+// DefaultBranchForWorktree returns the default branch of the repository that
+// owns worktreePath, with both the root discovery and the branch lookup
+// resolved by the worktree's own backend (the same dispatch as ResetWorktree
+// and friends), so a pooled slot can always be released even when the opt-in
+// that created it is no longer visible.
+func DefaultBranchForWorktree(worktreePath string) (string, error) {
+	b := backendForWorktree(worktreePath)
+	repoRoot, err := b.FindRepoRootFrom(worktreePath)
+	if err != nil {
+		return "", err
+	}
+	return b.GetDefaultBranch(repoRoot)
+}
+
 // IsHeadMergedIntoRef reports whether the worktree's current head is merged
 // into ref.
 func IsHeadMergedIntoRef(worktreePath, ref string) (bool, error) {
-	return backendFor(worktreePath).IsHeadMergedIntoRef(worktreePath, ref)
+	return backendForWorktree(worktreePath).IsHeadMergedIntoRef(worktreePath, ref)
 }
 
 // IsDirty reports tracked or untracked local changes in the worktree.
 func IsDirty(worktreePath string) (bool, error) {
-	return backendFor(worktreePath).IsDirty(worktreePath)
+	return backendForWorktree(worktreePath).IsDirty(worktreePath)
 }
 
 // ShortHash returns a short stable hash of s, used for pool directory naming.
@@ -324,4 +421,27 @@ func IsDirty(worktreePath string) (bool, error) {
 func ShortHash(s string) string {
 	h := sha256.Sum256([]byte(s))
 	return fmt.Sprintf("%x", h[:3])
+}
+
+// IsOriginAccessError reports whether err reads like a failure to reach or
+// use the origin remote. Classification is by the error's content, not the
+// configured backend: the error already happened in whichever backend
+// produced it, and each backend owns its own vocabulary.
+func IsOriginAccessError(err error) bool {
+	return gitvcs.IsOriginAccessError(err) || jjvcs.IsOriginAccessError(err)
+}
+
+// BackendNameFor names the backend the repository's configuration selects
+// for path ("git" or "jj"), without performing any operation.
+func BackendNameFor(path string) string { return backendFor(path).Name() }
+
+// WorktreeBackendName names the backend a worktree's own marker identifies
+// ("git" or "jj"), or "" when path holds no marker. This is the flavor a
+// pool slot actually is, as opposed to what the repository currently
+// selects.
+func WorktreeBackendName(path string) string {
+	if b := slotMarkerBackend(path); b != nil {
+		return b.Name()
+	}
+	return ""
 }

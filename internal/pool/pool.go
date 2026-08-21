@@ -20,13 +20,17 @@ const (
 	StatusInUse     = "in-use"
 	StatusLeased    = "leased"
 	StatusHere      = "you're here"
+	StatusDamaged   = "damaged"
 )
 
 // WorktreeStatus describes one managed worktree as reported by List.
 type WorktreeStatus struct {
-	Name      string
-	Path      string
-	Status    string
+	Name   string
+	Path   string
+	Status string
+	// Flavor is the backend the worktree's own marker identifies ("git" or
+	// "jj"), independent of what the repository currently selects.
+	Flavor    string
 	Processes []process.ProcessInfo
 	// LeaseID identifies the current acquisition of a leased worktree.
 	LeaseID string
@@ -134,9 +138,33 @@ func acquire(repoRoot, poolDir string, poolSize int, postCreate []string, opts a
 
 		state = healState(state)
 
-		// Try to find an available worktree (clean, not in-use, not leased)
+		// Try to find an available worktree (clean, not in-use, not leased,
+		// and of the flavor the repository currently selects: a caller who
+		// opted in to jj must not be handed a git worktree where jj commands
+		// do not work, and vice versa; other-flavor slots are left intact
+		// and leave the pool via the documented migration, destroy then
+		// re-acquire).
+		wantFlavor := vcs.BackendNameFor(repoRoot)
+		otherFlavor := 0
 		for i, wt := range state.Worktrees {
 			if wt.Destroying || wt.Leased || ownerAlive(wt) {
+				continue
+			}
+			flavor := vcs.WorktreeBackendName(wt.Path)
+			if flavor == "" {
+				// No .git or .jj marker: the slot is damaged or missing.
+				// Every dispatch on such a path falls back to the
+				// configured backend, which in an in-project pool resolves
+				// the repository ENCLOSING the pool - the safety checks
+				// would vouch for that repository and the reset would
+				// rewrite it. Fail closed and leave the slot for destroy,
+				// which classifies it unverified and removes it only with
+				// --include-unlanded; prune skips it as unverifiable and
+				// neither path ever resets it.
+				continue
+			}
+			if flavor != wantFlavor {
+				otherFlavor++
 				continue
 			}
 			inUse, _ := process.IsWorktreeInUse(wt.Path)
@@ -176,6 +204,9 @@ func acquire(repoRoot, poolDir string, poolSize int, postCreate []string, opts a
 
 		// No available worktree — create new if pool allows
 		if len(state.Worktrees) >= poolSize {
+			if otherFlavor > 0 {
+				return fmt.Errorf("all %d worktrees are in use, dirty, or hold the other backend's worktrees (%d %s-flavored; the repository selects %s). Run 'treehouse status' to see details, destroy old-flavor worktrees to migrate the pool, or increase max_trees in treehouse.toml", len(state.Worktrees), otherFlavor, map[string]string{"git": "jj", "jj": "git"}[wantFlavor], wantFlavor)
+			}
 			return fmt.Errorf("all %d worktrees are in use or dirty (max_trees = %d). Run 'treehouse status' to see details, or increase max_trees in treehouse.toml", len(state.Worktrees), poolSize)
 		}
 
@@ -296,14 +327,20 @@ func ValidateReleasePreconditions(poolDir, worktreePath string, preconditions Re
 // the worktree, and clears its reservation while holding one state lock. The
 // callback is invoked only after all preconditions match and runs under that
 // lock so caller-side termination or detachment cannot race a later acquisition.
+// A markerless slot (its .git/.jj marker is gone) is never reset or asked for a
+// branch: dispatch on such a path falls back to the configured backend, which
+// in an in-project pool resolves the repository ENCLOSING the pool. Its
+// reservation is still cleared so the slot is not stuck leased, and the damaged
+// slot is left for destroy; acquire refuses to reuse it.
 func ReleaseConditional(poolDir, worktreePath string, preconditions ReleasePreconditions, beforeReset func() error) error {
-	repoRoot, err := vcs.FindRepoRootFrom(worktreePath)
-	if err != nil {
-		return err
-	}
-	branch, err := vcs.GetDefaultBranch(repoRoot)
-	if err != nil {
-		return err
+	markerless := vcs.WorktreeBackendName(worktreePath) == ""
+	branch := ""
+	if !markerless {
+		resolved, err := vcs.DefaultBranchForWorktree(worktreePath)
+		if err != nil {
+			return err
+		}
+		branch = resolved
 	}
 	return WithStateLock(poolDir, func() error {
 		state, err := ReadState(poolDir)
@@ -320,8 +357,10 @@ func ReleaseConditional(poolDir, worktreePath string, preconditions ReleasePreco
 				return err
 			}
 		}
-		if err := vcs.ResetWorktree(worktreePath, branch); err != nil {
-			return err
+		if !markerless {
+			if err := vcs.ResetWorktree(worktreePath, branch); err != nil {
+				return err
+			}
 		}
 
 		wt.OwnerPID = 0
@@ -366,6 +405,10 @@ func validateReleasePreconditions(wt WorktreeEntry, preconditions ReleasePrecond
 
 // List returns the current status of managed worktrees in poolDir.
 // Leased worktrees are reported with StatusLeased and their optional holder.
+// An idle slot whose .git/.jj marker is gone is reported StatusDamaged: its
+// dirtiness is never read, because dispatch on a markerless path falls back to
+// the configured backend, which in an in-project pool answers with the facts
+// of the repository ENCLOSING the pool.
 func List(poolDir string) ([]WorktreeStatus, error) {
 	var result []WorktreeStatus
 
@@ -390,6 +433,7 @@ func List(poolDir string) ([]WorktreeStatus, error) {
 				Name:   wt.Name,
 				Path:   wt.Path,
 				Status: StatusAvailable,
+				Flavor: vcs.WorktreeBackendName(wt.Path),
 			}
 
 			procs, _ := process.FindProcessesInWorktree(wt.Path)
@@ -407,6 +451,8 @@ func List(poolDir string) ([]WorktreeStatus, error) {
 				if cwdInWorktree(cwd, wt.Path) {
 					ws.Status = StatusHere
 				}
+			} else if ws.Flavor == "" {
+				ws.Status = StatusDamaged
 			} else if dirty, _ := vcs.IsDirty(wt.Path); dirty {
 				ws.Status = StatusDirty
 			}

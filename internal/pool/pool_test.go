@@ -885,7 +885,7 @@ func TestExecuteDestroy_ReclassifiesBeforeReservation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadState failed: %v", err)
 	}
-	planned := classifyForDestroy(state.Worktrees[0], defaultRef)
+	planned := classifyForDestroy(state.Worktrees[0], repoDir, defaultRef)
 	measureDestroySize(&planned)
 
 	scratch := filepath.Join(wtPath, "raced-wip.txt")
@@ -928,7 +928,7 @@ func TestExecuteDestroy_KeepsStateWhenRemovalFails(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadState failed: %v", err)
 	}
-	planned := classifyForDestroy(state.Worktrees[0], defaultRef)
+	planned := classifyForDestroy(state.Worktrees[0], repoDir, defaultRef)
 	measureDestroySize(&planned)
 
 	badRepoRoot := filepath.Join(t.TempDir(), "not-a-repo")
@@ -973,7 +973,7 @@ func TestExecuteDestroy_ReResolvesRepoRootWhenMissing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadState failed: %v", err)
 	}
-	planned := classifyForDestroy(state.Worktrees[0], defaultRef)
+	planned := classifyForDestroy(state.Worktrees[0], repoDir, defaultRef)
 	measureDestroySize(&planned)
 
 	destroyed, skipped, err := executeDestroy(poolDir, []DestroyTarget{planned}, "", defaultRef, true, DestroyOptions{})
@@ -1023,7 +1023,7 @@ func TestExecuteDestroy_RemovalFailureRestoresOriginalOwnerReservation(t *testin
 	if original.OwnerPID == 0 || original.OwnerStartedAt == 0 {
 		t.Fatalf("expected acquired worktree to have owner reservation, got %#v", original)
 	}
-	planned := classifyForDestroy(original, defaultRef)
+	planned := classifyForDestroy(original, repoDir, defaultRef)
 	measureDestroySize(&planned)
 
 	badRepoRoot := filepath.Join(t.TempDir(), "not-a-repo")
@@ -2437,4 +2437,327 @@ func TestHoldCwdProbe(t *testing.T) {
 func quoteForShell(p string) string {
 	// Double-quote works in both sh and cmd.exe for paths without quotes.
 	return `"` + p + `"`
+}
+
+// TestBackingRepositoryMissingJJ mirrors the git orphan detection for jj
+// slots: a pooled workspace whose .jj/repo pointer names a deleted store
+// must classify as orphaned, and one whose store exists must not. Pure file
+// fixtures: no jj binary required.
+func TestBackingRepositoryMissingJJ(t *testing.T) {
+	base := t.TempDir()
+	store := filepath.Join(base, "repo", ".jj", "repo")
+	if err := os.MkdirAll(store, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	slot := filepath.Join(base, "slot")
+	if err := os.MkdirAll(filepath.Join(slot, ".jj"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	pointer := filepath.Join(slot, ".jj", "repo")
+	if err := os.WriteFile(pointer, []byte(store+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if missing, detail := backingRepositoryMissing(slot); missing {
+		t.Fatalf("store exists; expected not orphaned, got %q", detail)
+	}
+
+	if err := os.RemoveAll(filepath.Join(base, "repo")); err != nil {
+		t.Fatal(err)
+	}
+	missing, detail := backingRepositoryMissing(slot)
+	if !missing {
+		t.Fatal("store deleted; expected the slot to classify as orphaned")
+	}
+	if !strings.Contains(detail, "jj store") {
+		t.Fatalf("detail should name the jj store, got %q", detail)
+	}
+
+	// A jj slot with a corrupt (empty) store pointer cannot classify as an
+	// orphan, and the diagnostic must name the jj pointer problem rather than
+	// the absent .git entry.
+	corrupt := filepath.Join(base, "corrupt")
+	if err := os.MkdirAll(filepath.Join(corrupt, ".jj"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(corrupt, ".jj", "repo"), []byte("\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	missing, detail = backingRepositoryMissing(corrupt)
+	if missing {
+		t.Fatal("a corrupt pointer must not classify as orphaned")
+	}
+	if !strings.Contains(detail, filepath.Join(".jj", "repo")) {
+		t.Fatalf("detail should name the jj store pointer, got %q", detail)
+	}
+
+	// A main workspace (.jj/repo is the store directory itself) is not a
+	// linked worktree and must never classify as orphaned.
+	if missing, _ := backingRepositoryMissing(filepath.Join(base, "mainws")); missing {
+		t.Fatal("nonexistent path must not classify as orphaned")
+	}
+	mainws := filepath.Join(base, "mainws", ".jj", "repo")
+	if err := os.MkdirAll(mainws, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if missing, _ := backingRepositoryMissing(filepath.Join(base, "mainws")); missing {
+		t.Fatal("a main workspace must not classify as orphaned")
+	}
+}
+
+// TestAcquire_SkipsMarkerlessSlot pins the fail-closed contract for damaged
+// slots: a pool entry whose .git/.jj marker is gone must never be admitted to
+// reuse. Dispatching on a markerless path falls back to the configured
+// backend, which in an in-project pool resolves the repository ENCLOSING the
+// pool, so the safety checks would vouch for that repository and the reset
+// would rewrite it - deleting untracked files or moving its checkout.
+func TestAcquire_SkipsMarkerlessSlot(t *testing.T) {
+	repoDir, _ := setupRepo(t)
+	poolDir := filepath.Join(repoDir, "pool") // in-project pool root
+
+	wtPath, err := Acquire(repoDir, poolDir, 2, nil)
+	if err != nil {
+		t.Fatalf("Acquire failed: %v", err)
+	}
+	clearOwnerReservation(t, poolDir, wtPath)
+
+	// Damage the slot: its .git marker disappears.
+	if err := os.Remove(filepath.Join(wtPath, ".git")); err != nil {
+		t.Fatalf("removing the slot marker: %v", err)
+	}
+	// Untracked work in the enclosing repository that a misdirected reset
+	// would delete, and the checkout position it would move.
+	precious := filepath.Join(repoDir, "untracked.txt")
+	if err := os.WriteFile(precious, []byte("precious\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	headBefore := gitOut(t, repoDir, "rev-parse", "HEAD")
+
+	second, err := Acquire(repoDir, poolDir, 2, nil)
+	if err != nil {
+		t.Fatalf("Acquire should create a fresh slot instead: %v", err)
+	}
+	if second == wtPath {
+		t.Fatal("acquire admitted a markerless slot to reuse")
+	}
+	if _, err := os.Stat(precious); err != nil {
+		t.Fatalf("untracked file in the enclosing repository must survive: %v", err)
+	}
+	if headAfter := gitOut(t, repoDir, "rev-parse", "HEAD"); headAfter != headBefore {
+		t.Fatalf("enclosing repository checkout moved: %s -> %s", headBefore, headAfter)
+	}
+}
+
+// TestAcquire_MarkerlessSlotSelfIgnoringPool reproduces the reviewed failure
+// exactly as production reaches it. `treehouse get` writes a self-ignoring
+// .gitignore into the pool root, so the enclosing repository reports itself
+// clean and the fallback dirty check cannot accidentally shield the damaged
+// slot. Before the fail-closed guard, acquire admitted the markerless slot to
+// reuse and ResetWorktreeToRef committed a raw commit ID onto the enclosing
+// repository's HEAD, detaching its checkout off the default branch.
+func TestAcquire_MarkerlessSlotSelfIgnoringPool(t *testing.T) {
+	repoDir, _ := setupRepo(t)
+	poolDir := filepath.Join(repoDir, "pool") // in-project pool root
+	if err := os.MkdirAll(poolDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(poolDir, ".gitignore"), []byte("*\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	wtPath, err := Acquire(repoDir, poolDir, 2, nil)
+	if err != nil {
+		t.Fatalf("Acquire failed: %v", err)
+	}
+	clearOwnerReservation(t, poolDir, wtPath)
+	if err := os.Remove(filepath.Join(wtPath, ".git")); err != nil {
+		t.Fatalf("removing the slot marker: %v", err)
+	}
+	headBefore := gitOut(t, repoDir, "rev-parse", "HEAD")
+
+	second, err := Acquire(repoDir, poolDir, 2, nil)
+	if err != nil {
+		t.Fatalf("Acquire should create a fresh slot instead: %v", err)
+	}
+	if second == wtPath {
+		t.Fatal("acquire admitted a markerless slot to reuse")
+	}
+	if headAfter := gitOut(t, repoDir, "rev-parse", "HEAD"); headAfter != headBefore {
+		t.Fatalf("enclosing repository checkout moved: %s -> %s", headBefore, headAfter)
+	}
+	if ref := gitOut(t, repoDir, "rev-parse", "--abbrev-ref", "HEAD"); ref != "main" {
+		t.Fatalf("enclosing repository HEAD detached off main to %q", ref)
+	}
+}
+
+// TestRelease_MarkerlessSlotClearsLeaseWithoutReset pins the release side of
+// the same contract: returning a slot whose .git/.jj marker is gone must clear
+// its lease without dispatching branch discovery or a reset, which would fall
+// back to the configured backend and rewrite the repository ENCLOSING an
+// in-project pool.
+func TestRelease_MarkerlessSlotClearsLeaseWithoutReset(t *testing.T) {
+	repoDir, _ := setupRepo(t)
+	poolDir := filepath.Join(repoDir, "pool") // in-project pool root
+
+	lease, err := AcquireLeaseInfo(repoDir, poolDir, 2, nil, "holder")
+	if err != nil {
+		t.Fatalf("AcquireLeaseInfo failed: %v", err)
+	}
+	if err := os.Remove(filepath.Join(lease.Path, ".git")); err != nil {
+		t.Fatalf("removing the slot marker: %v", err)
+	}
+	precious := filepath.Join(repoDir, "untracked.txt")
+	if err := os.WriteFile(precious, []byte("precious\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	headBefore := gitOut(t, repoDir, "rev-parse", "HEAD")
+
+	if err := Release(poolDir, lease.Path); err != nil {
+		t.Fatalf("Release failed: %v", err)
+	}
+
+	entry, err := FindByPath(poolDir, lease.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry == nil {
+		t.Fatal("released slot must stay managed")
+	}
+	if entry.Leased {
+		t.Fatal("release must clear the lease on a markerless slot")
+	}
+	if _, err := os.Stat(precious); err != nil {
+		t.Fatalf("untracked file in the enclosing repository must survive: %v", err)
+	}
+	if headAfter := gitOut(t, repoDir, "rev-parse", "HEAD"); headAfter != headBefore {
+		t.Fatalf("enclosing repository checkout moved: %s -> %s", headBefore, headAfter)
+	}
+	if ref := gitOut(t, repoDir, "rev-parse", "--abbrev-ref", "HEAD"); ref != "main" {
+		t.Fatalf("enclosing repository HEAD moved off main to %q", ref)
+	}
+}
+
+// TestDestroyWorktree_MarkerlessSlot pins destroy's side of the remediation
+// story: a slot whose .git/.jj marker is gone classifies as unverified (its
+// facts are never read from the repository enclosing the pool) and is actually
+// removable with --include-unlanded through the plain-directory route, freeing
+// its max_trees seat; the stale VCS registration self-heals at the next add.
+func TestDestroyWorktree_MarkerlessSlot(t *testing.T) {
+	repoDir, _ := setupRepo(t)
+	poolDir := filepath.Join(repoDir, "pool") // in-project pool root
+
+	wtPath, err := Acquire(repoDir, poolDir, 1, nil)
+	if err != nil {
+		t.Fatalf("Acquire failed: %v", err)
+	}
+	clearOwnerReservation(t, poolDir, wtPath)
+	if err := os.Remove(filepath.Join(wtPath, ".git")); err != nil {
+		t.Fatalf("removing the slot marker: %v", err)
+	}
+	precious := filepath.Join(repoDir, "untracked.txt")
+	if err := os.WriteFile(precious, []byte("precious\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	dryRun, err := DestroyWorktree(poolDir, wtPath, DestroyOptions{DryRun: true})
+	if err != nil {
+		t.Fatalf("DestroyWorktree dry run failed: %v", err)
+	}
+	if len(dryRun.Planned) != 0 || len(dryRun.Skipped) != 1 {
+		t.Fatalf("expected one skip and no planned targets, got %+v", dryRun)
+	}
+	if got := dryRun.Skipped[0].Target.Class; got != DestroyUnverified {
+		t.Fatalf("expected class %q, got %q", DestroyUnverified, got)
+	}
+	if got := dryRun.Skipped[0].NeededFlag; got != IncludeUnlandedFlag {
+		t.Fatalf("expected needed flag %q, got %q", IncludeUnlandedFlag, got)
+	}
+
+	result, err := DestroyWorktree(poolDir, wtPath, DestroyOptions{IncludeUnlanded: true})
+	if err != nil {
+		t.Fatalf("DestroyWorktree failed: %v", err)
+	}
+	if len(result.Destroyed) != 1 {
+		t.Fatalf("expected the markerless slot removed, got %+v", result)
+	}
+	if _, err := os.Stat(wtPath); !os.IsNotExist(err) {
+		t.Fatalf("expected worktree directory removed, stat err = %v", err)
+	}
+	if _, err := os.Stat(precious); err != nil {
+		t.Fatalf("untracked file in the enclosing repository must survive: %v", err)
+	}
+
+	// The freed seat is usable again: the stale git registration self-heals
+	// at the next add.
+	if _, err := Acquire(repoDir, poolDir, 1, nil); err != nil {
+		t.Fatalf("Acquire after destroying the markerless slot failed: %v", err)
+	}
+}
+
+// TestList_MarkerlessSlotReportsDamaged pins status's side of the contract: an
+// idle slot whose .git/.jj marker is gone is reported with its own damaged
+// status, never with dirtiness read from the repository enclosing an
+// in-project pool (which would label the slot available or dirty from someone
+// else's facts).
+func TestList_MarkerlessSlotReportsDamaged(t *testing.T) {
+	repoDir, _ := setupRepo(t)
+	poolDir := filepath.Join(repoDir, "pool") // in-project pool root
+
+	wtPath, err := Acquire(repoDir, poolDir, 2, nil)
+	if err != nil {
+		t.Fatalf("Acquire failed: %v", err)
+	}
+	clearOwnerReservation(t, poolDir, wtPath)
+	if err := os.Remove(filepath.Join(wtPath, ".git")); err != nil {
+		t.Fatalf("removing the slot marker: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "untracked.txt"), []byte("dirty\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	statuses, err := List(poolDir)
+	if err != nil {
+		t.Fatalf("List failed: %v", err)
+	}
+	if len(statuses) != 1 {
+		t.Fatalf("expected one worktree, got %+v", statuses)
+	}
+	if statuses[0].Status != StatusDamaged {
+		t.Fatalf("expected status %q, got %q", StatusDamaged, statuses[0].Status)
+	}
+	if statuses[0].Flavor != "" {
+		t.Fatalf("expected empty flavor for a markerless slot, got %q", statuses[0].Flavor)
+	}
+}
+
+// TestPrune_MarkerlessSlotSkippedAsCannotVerify pins prune's classification:
+// a slot whose .git/.jj marker is gone is reported as cannot-verify - the
+// enclosing repository's facts must not decide whether it is deletable - and
+// is left on disk.
+func TestPrune_MarkerlessSlotSkippedAsCannotVerify(t *testing.T) {
+	repoDir, _ := setupRepo(t)
+	poolDir := filepath.Join(repoDir, "pool") // in-project pool root
+
+	wtPath, err := Acquire(repoDir, poolDir, 2, nil)
+	if err != nil {
+		t.Fatalf("Acquire failed: %v", err)
+	}
+	clearOwnerReservation(t, poolDir, wtPath)
+	if err := os.Remove(filepath.Join(wtPath, ".git")); err != nil {
+		t.Fatalf("removing the slot marker: %v", err)
+	}
+
+	result, err := Prune(repoDir, poolDir, false, nil)
+	if err != nil {
+		t.Fatalf("Prune failed: %v", err)
+	}
+	if len(result.Pruned) != 0 || len(result.Candidates) != 0 {
+		t.Fatalf("prune must not touch a markerless slot, got %+v", result)
+	}
+	if len(result.Skipped) != 1 || result.Skipped[0].Category != pruneSkipCannotVerify {
+		t.Fatalf("expected one cannot-verify skip, got %+v", result.Skipped)
+	}
+	if _, err := os.Stat(wtPath); err != nil {
+		t.Fatalf("markerless slot must stay on disk: %v", err)
+	}
 }

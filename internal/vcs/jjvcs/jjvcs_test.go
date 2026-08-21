@@ -1,6 +1,7 @@
 package jjvcs
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -327,6 +328,13 @@ func TestResetWorktreeToRefRefusesWhenDirtyAfterSafetyCheck(t *testing.T) {
 		t.Fatal("expected fresh workspace to be safe to reset")
 	}
 
+	// Record the working-copy identity jj actually preserves. The moment
+	// any jj command snapshots the dirtied tree, @ is amended in place:
+	// its commit id changes but its change id and parent do not, and head
+	// (the commit id pinned at check time) is what makes the reset refuse.
+	changeBefore := strings.TrimSpace(mustJJ(t, wtPath, "log", "-r", "@", "--no-graph", "-T", "change_id"))
+	parentBefore := strings.TrimSpace(mustJJ(t, wtPath, "log", "-r", "@-", "--no-graph", "-T", "commit_id"))
+
 	scratch := filepath.Join(wtPath, "scratch.txt")
 	writeFile(t, scratch, "keep\n")
 
@@ -338,12 +346,16 @@ func TestResetWorktreeToRefRefusesWhenDirtyAfterSafetyCheck(t *testing.T) {
 		t.Fatalf("expected dirty-after-check error, got %v", err)
 	}
 
-	got, err := worktreeHead(wtPath)
-	if err != nil {
-		t.Fatalf("resolve preserved HEAD: %v", err)
+	// Commit-id equality across a dirtying event is not a jj invariant:
+	// snapshotting amends @'s commit id. Assert what the refusal
+	// guarantees instead - same change, same parent, work intact.
+	changeAfter := strings.TrimSpace(mustJJ(t, wtPath, "log", "-r", "@", "--no-graph", "-T", "change_id"))
+	if changeAfter != changeBefore {
+		t.Fatalf("expected working-copy change %s preserved, got %s", changeBefore, changeAfter)
 	}
-	if got != head {
-		t.Fatalf("expected HEAD %s preserved, got %s", head, got)
+	parentAfter := strings.TrimSpace(mustJJ(t, wtPath, "log", "-r", "@-", "--no-graph", "-T", "commit_id"))
+	if parentAfter != parentBefore {
+		t.Fatalf("expected parent %s preserved, got %s", parentBefore, parentAfter)
 	}
 	contents, err := os.ReadFile(scratch)
 	if err != nil {
@@ -482,5 +494,83 @@ func TestRemoveWorktreeRefusesMainWorkspace(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(repoDir, "README.md")); err != nil {
 		t.Fatalf("repository contents must survive a refused removal: %v", err)
+	}
+}
+
+// TestSymlinkedRepoPathResolvesOneRootIdentity pins the symlink
+// canonicalization contract: a repository reached through a symlinked path
+// (like macOS's /tmp -> /private/tmp) must resolve to the same root string
+// from every route - `jj workspace root` in the main repo and the .jj/repo
+// pointer inside a pooled workspace - because the pool identity is derived
+// from that string. Before canonicalization the two routes disagreed and
+// treehouse status inside a workspace resolved a phantom, empty pool.
+func TestSymlinkedRepoPathResolvesOneRootIdentity(t *testing.T) {
+	requireJJ(t)
+	isolateJJConfig(t)
+	base := t.TempDir()
+	realDir := filepath.Join(base, "real")
+	if err := os.MkdirAll(realDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	linkDir := filepath.Join(base, "link")
+	if err := os.Symlink(realDir, linkDir); err != nil {
+		t.Skipf("cannot create symlinks here: %v", err)
+	}
+
+	// Init and use the repository exclusively through the symlinked path.
+	repoVia := filepath.Join(linkDir, "repo")
+	if err := os.MkdirAll(repoVia, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustJJ(t, repoVia, "git", "init")
+	mustJJ(t, repoVia, "bookmark", "create", "main", "-r", "@")
+
+	b := &Backend{}
+	wsPath := filepath.Join(base, "ws")
+	if err := b.AddWorktree(repoVia, wsPath, "main"); err != nil {
+		t.Fatalf("AddWorktree through symlinked path: %v", err)
+	}
+
+	fromMain, err := b.FindRepoRootFrom(repoVia)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fromWorkspace, err := b.FindMainRepoRootFrom(wsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := filepath.EvalSymlinks(filepath.Join(realDir, "repo"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fromMain != want {
+		t.Fatalf("main-repo route: got %q, want physical %q", fromMain, want)
+	}
+	if fromWorkspace != want {
+		t.Fatalf("workspace route: got %q, want physical %q", fromWorkspace, want)
+	}
+}
+
+// TestIsOriginAccessErrorJJ pins jj's unreachable-origin vocabulary, each
+// string captured from a real jj git fetch failure (jj 0.43).
+func TestIsOriginAccessErrorJJ(t *testing.T) {
+	cases := []struct {
+		detail string
+		want   bool
+	}{
+		{"Error: Git process failed: External git program failed:", true},
+		{"fatal: unable to access 'https://x/': Could not resolve host: x", true},
+		{"Error: Could not find repository at '/nonexistent/repo.git'", true},
+		{"Error: Workspace is stale", false},
+		{"", false},
+	}
+	for _, c := range cases {
+		got := IsOriginAccessError(errors.New(c.detail))
+		if got != c.want {
+			t.Errorf("IsOriginAccessError(%q) = %v, want %v", c.detail, got, c.want)
+		}
+	}
+	if IsOriginAccessError(nil) {
+		t.Error("nil error must not classify as an origin access error")
 	}
 }

@@ -1,6 +1,7 @@
 package vcs
 
 import (
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -345,5 +346,174 @@ func TestRemoveWorktreeDispatchesOnSlotFlavorJJWithoutOptIn(t *testing.T) {
 	}
 	if strings.Contains(string(out), "th-") {
 		t.Fatalf("jj workspace registration left stale after removal:\n%s", out)
+	}
+}
+
+// TestWorktreeFactsUseSlotFlavor pins the deletion-safety contract behind
+// destroy/prune: the facts that gate destruction (dirty, merged) must come
+// from the slot's own VCS even when the repository's opt-in is gone. Before
+// this dispatch existed, a .jj-only slot inspected without the opt-in fell
+// back to git, which walked up and read the ENCLOSING repository's facts: in
+// an in-project pool a clean enclosing repo made dirty jj work classify as
+// clean and merged - i.e. disposable.
+func TestWorktreeFactsUseSlotFlavor(t *testing.T) {
+	if _, err := exec.LookPath("jj"); err != nil {
+		t.Skip("jj is not installed")
+	}
+	isolateJJConfig(t)
+	isolateUserConfig(t)
+	dir := t.TempDir()
+	mustRun(t, dir, "git", "init", "-b", "main")
+	if err := os.WriteFile(filepath.Join(dir, "f.txt"), []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustRun(t, dir, "git", "add", "-A")
+	mustRun(t, dir, "git", "-c", "user.name=t", "-c", "user.email=t@e.com", "commit", "-qm", "init")
+	mustRun(t, dir, "jj", "git", "init", "--colocate")
+
+	// The jj slot lives INSIDE the (clean, on-main) repository, as an
+	// in-project pool root would place it, and is created under an opt-in
+	// that is gone again by inspection time.
+	slot := filepath.Join(dir, "pool", "1", "repo")
+	if err := os.MkdirAll(filepath.Dir(slot), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TREEHOUSE_VCS", "jj")
+	if err := AddWorktree(dir, slot, "main"); err != nil {
+		t.Fatalf("creating the jj slot: %v", err)
+	}
+	t.Setenv("TREEHOUSE_VCS", "")
+	if err := os.WriteFile(filepath.Join(slot, "wip.txt"), []byte("unlanded\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	dirty, err := IsDirty(slot)
+	if err != nil {
+		t.Fatalf("IsDirty on the jj slot without opt-in: %v", err)
+	}
+	if !dirty {
+		t.Fatal("the slot's own jj facts say dirty; reading the enclosing repository said clean")
+	}
+
+	// The acquire-safety pair obeys the same contract: read through the
+	// slot's own backend, never the enclosing repository's. Commit the
+	// work in the slot: jj's ancestry check reads it as unmerged (unsafe),
+	// while the enclosing git repository - clean and on main - would
+	// report safe and hand acquire a green light to discard it.
+	mustRun(t, slot, "jj", "commit", "-m", "unlanded work")
+	safe, _, _, err := IsWorktreeSafeToReset(slot, "main")
+	if err == nil && safe {
+		t.Fatal("a jj slot with unmerged commits must not be safe to reset; the enclosing repository's git facts leaked through")
+	}
+	if err := ResetWorktreeToRef(slot, "main", "", true); err == nil {
+		t.Fatal("ResetWorktreeToRef through the wrong backend must refuse, not reset the enclosing repository")
+	}
+	if got, want := readFileOrEmpty(t, filepath.Join(slot, "wip.txt")), "unlanded\n"; got != want {
+		t.Fatalf("the slot's unlanded work must survive, got %q", got)
+	}
+}
+
+func readFileOrEmpty(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
+// TestUnrecognizedVCSValueWarnsOnceAndDefaults pins the misconfiguration
+// contract: a value like "Jujutsu" is ignored (git default preserved) but a
+// warning names the bad value and its source exactly once, on stderr only.
+func TestUnrecognizedVCSValueWarnsOnceAndDefaults(t *testing.T) {
+	isolateUserConfig(t)
+	dir := t.TempDir()
+	mustRun(t, dir, "git", "init", "-b", "main")
+	if err := os.WriteFile(filepath.Join(dir, "treehouse.toml"), []byte("vcs = \"Jujutsu\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldStderr := os.Stderr
+	os.Stderr = w
+	defer func() { os.Stderr = oldStderr }()
+
+	first := backendFor(dir).Name()
+	second := backendFor(dir).Name()
+	w.Close()
+	os.Stderr = oldStderr
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if first != "git" || second != "git" {
+		t.Fatalf("unrecognized value must keep the git default, got %q/%q", first, second)
+	}
+	warning := string(out)
+	if !strings.Contains(warning, "Jujutsu") || !strings.Contains(warning, "treehouse.toml") {
+		t.Fatalf("warning must name the value and its source, got %q", warning)
+	}
+	if strings.Count(warning, "unrecognized vcs value") != 1 {
+		t.Fatalf("warning must appear exactly once across repeated selection, got %q", warning)
+	}
+}
+
+// TestDestructiveWrappersRefuseMarkerlessPath pins the defense-in-depth
+// boundary: ResetWorktree, ResetWorktreeToRef, and DetachWorktree refuse a
+// path holding no .git or .jj marker instead of dispatching through the
+// configured backend, which inside a repository would rewrite the enclosing
+// checkout.
+func TestDestructiveWrappersRefuseMarkerlessPath(t *testing.T) {
+	isolateUserConfig(t)
+	repo := t.TempDir()
+	mustRun(t, repo, "git", "init", "--initial-branch=main")
+	mustRun(t, repo, "git", "config", "user.email", "test@test.com")
+	mustRun(t, repo, "git", "config", "user.name", "Test")
+	tracked := filepath.Join(repo, "tracked.txt")
+	if err := os.WriteFile(tracked, []byte("committed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustRun(t, repo, "git", "add", ".")
+	mustRun(t, repo, "git", "commit", "-m", "initial")
+	if err := os.WriteFile(tracked, []byte("uncommitted\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	slot := filepath.Join(repo, "pool", "1", "slot")
+	if err := os.MkdirAll(slot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	calls := []struct {
+		name string
+		call func() error
+	}{
+		{"ResetWorktree", func() error { return ResetWorktree(slot, "main") }},
+		{"ResetWorktreeToRef", func() error { return ResetWorktreeToRef(slot, "main", "", true) }},
+		{"DetachWorktree", func() error { return DetachWorktree(slot) }},
+	}
+	for _, c := range calls {
+		err := c.call()
+		if err == nil {
+			t.Fatalf("%s must refuse a markerless path", c.name)
+		}
+		if !strings.Contains(err.Error(), "no .git or .jj marker") {
+			t.Fatalf("%s error should name the missing marker, got %v", c.name, err)
+		}
+	}
+
+	data, err := os.ReadFile(tracked)
+	if err != nil || string(data) != "uncommitted\n" {
+		t.Fatalf("enclosing repository's uncommitted change must survive: %q, %v", data, err)
+	}
+	out, err := exec.Command("git", "-C", repo, "rev-parse", "--abbrev-ref", "HEAD").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ref := strings.TrimSpace(string(out)); ref != "main" {
+		t.Fatalf("enclosing repository HEAD moved off main to %q", ref)
 	}
 }
