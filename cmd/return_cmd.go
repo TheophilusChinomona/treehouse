@@ -65,9 +65,11 @@ var returnCmd = &cobra.Command{
 				})
 			}
 		} else {
-			err = prepareWorktreeReturn(wtPath)
+			err = confirmWorktreeReturn(wtPath)
 			if err == nil {
-				err = pool.Release(poolDir, wtPath)
+				err = pool.ReleaseConditional(poolDir, wtPath, pool.ReleasePreconditions{}, func() error {
+					return finalizeWorktreeReturn(wtPath)
+				})
 			}
 		}
 		if errors.Is(err, errReturnAborted) {
@@ -90,13 +92,6 @@ func init() {
 	rootCmd.AddCommand(returnCmd)
 }
 
-func prepareWorktreeReturn(wtPath string) error {
-	if err := confirmWorktreeReturn(wtPath); err != nil {
-		return err
-	}
-	return finalizeWorktreeReturn(wtPath)
-}
-
 func confirmWorktreeReturn(wtPath string) error {
 	if !returnForce {
 		dirty, _ := git.IsDirty(wtPath)
@@ -117,8 +112,7 @@ func finalizeWorktreeReturn(wtPath string) error {
 		}
 	}
 
-	killLingeringProcesses(wtPath)
-	return nil
+	return killLingeringProcesses(wtPath)
 }
 
 func resolveWorktreePath(args []string) (string, error) {
