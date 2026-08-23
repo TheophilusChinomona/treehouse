@@ -1,0 +1,22 @@
+$ release-pr-gate-status structural check: genuine same-repo release-please PR
+PR #101 is a release-please release PR (same-repo branch 'release-please--branches--main' with the Release Please footer); exempt from the no-mistakes signature.
+exit=0
+
+$ release-pr-gate-status structural check: copied release PR from a fork
+::error::This PR was not raised through no-mistakes.
+
+Contributions to this repository must be submitted via 'git push no-mistakes'.
+That pipeline runs the required review/test/lint/CI steps and writes a
+deterministic '## Pipeline' section into the PR body containing:
+
+    Updates from [git push no-mistakes](https://github.com/kunchenguid/no-mistakes)
+
+The only other way to pass is release-please's own release PR, which must
+satisfy all three structural conditions: a 'release-please--'
+(or legacy 'release-please/') head branch, a
+same-repository (non-fork) head, and the Release Please body footer.
+
+PR author: structural-release-please-check
+Head branch: release-please--branches--main
+Head repository: attacker/treehouse (base kunchenguid/treehouse)
+exit=1
