@@ -18,9 +18,22 @@ import (
 // ruleset waits forever on a check nothing ever reports.
 const requiredCheckContext = "PR must be raised via no-mistakes"
 
-const gateWorkflowPath = ".github/workflows/no-mistakes-required.yml"
+const (
+	gateWorkflowPath    = ".github/workflows/no-mistakes-required.yml"
+	releaseWorkflowPath = ".github/workflows/release.yml"
+)
 
-// gateStep is the one workflow step that decides the required check.
+// gateScriptPath is the gate's executable decision surface. The required
+// check itself is now decided by the shared composite action the workflow
+// delegates to (tested upstream in the no-mistakes repository), but this script
+// is still what release.yml's release-pr-gate-status job runs to stamp the
+// required context on a release-please PR - GitHub creates no workflow runs on
+// a GITHUB_TOKEN PR, so nothing else can report there. These tests therefore
+// drive the script directly.
+const gateScriptPath = "./.github/scripts/no-mistakes-gate.sh"
+
+// gateStep is the gate invocation under test: the script plus the environment
+// contract documented in its own header.
 type gateStep struct {
 	env map[string]string
 	run string
@@ -28,18 +41,27 @@ type gateStep struct {
 
 type workflowFile struct {
 	Jobs map[string]struct {
-		Name  string `yaml:"name"`
-		If    string `yaml:"if"`
-		Steps []struct {
+		Name        string            `yaml:"name"`
+		If          string            `yaml:"if"`
+		Permissions map[string]string `yaml:"permissions"`
+		Steps       []struct {
 			Name string            `yaml:"name"`
+			Uses string            `yaml:"uses"`
 			Run  string            `yaml:"run"`
 			Env  map[string]string `yaml:"env"`
+			With map[string]string `yaml:"with"`
 		} `yaml:"steps"`
 	} `yaml:"jobs"`
 }
 
-// loadGateStep reads the real workflow and returns the step that runs the gate,
-// so the test drives the shipped configuration rather than a copy of it.
+// requireActionPin is the immutable commit the workflow must delegate to. A
+// mutable ref such as @main would let the pull request under judgement rewrite
+// its own judge; bumping this is a separate, deliberate pull request.
+const requireActionPin = "kunchenguid/no-mistakes/.github/actions/require-no-mistakes@32d396ac0f29135daf7fcb9964aba9d5f4e796d6"
+
+// loadGateStep verifies the shipped workflow still delegates the required check
+// to the pinned shared action, then returns the script invocation these tests
+// drive.
 func loadGateStep(t *testing.T) gateStep {
 	t.Helper()
 
@@ -56,18 +78,52 @@ func loadGateStep(t *testing.T) gateStep {
 		if job.Name != requiredCheckContext {
 			continue
 		}
-		// Every exemption must live in the script, not in a job-level `if:`,
-		// so the gate has a single executable decision surface.
+		// This workflow backs a REQUIRED status check, and a skipped job never
+		// reports the context, so the PR would block on a status that can never
+		// arrive. Exemptions must therefore ride as action inputs and keep the
+		// job running, never as a job-level `if:`.
 		if strings.TrimSpace(job.If) != "" {
-			t.Fatalf("job %q must not carry a job-level if:, it decides exemptions in the gate script", jobID)
+			t.Fatalf("job %q must not carry a job-level if:, a skipped job never reports the required check", jobID)
 		}
-		for _, step := range job.Steps {
-			if strings.TrimSpace(step.Run) == "" {
-				continue
+		if len(job.Steps) != 1 {
+			t.Fatalf("job %q has %d steps, want exactly the shared-action call", jobID, len(job.Steps))
+		}
+		step := job.Steps[0]
+		if strings.TrimSpace(step.Run) != "" {
+			t.Fatalf("job %q still carries inline enforcement; it must delegate to the shared action", jobID)
+		}
+		if step.Uses != requireActionPin {
+			t.Fatalf("job %q uses %q, want the pinned shared action %q", jobID, step.Uses, requireActionPin)
+		}
+		exemptAuthors := make(map[string]struct{})
+		for _, entry := range strings.FieldsFunc(step.With["exempt-authors"], func(r rune) bool {
+			return r == ',' || r == '\n' || r == '\r'
+		}) {
+			exemptAuthors[strings.TrimSpace(entry)] = struct{}{}
+		}
+		for _, login := range []string{"github-actions[bot]", "dependabot[bot]"} {
+			if _, ok := exemptAuthors[login]; !ok {
+				t.Errorf("job %q must exempt %q via the action's exempt-authors input", jobID, login)
 			}
-			return gateStep{env: step.Env, run: step.Run}
 		}
-		t.Fatalf("job %q has no run: step", jobID)
+
+		if _, err := os.Stat(gateScriptPath); err != nil {
+			t.Fatalf("release.yml still stamps the required context with this script: %v", err)
+		}
+		// The environment contract is the one documented in the script header
+		// and supplied by release.yml's release-pr-gate-status job.
+		return gateStep{
+			run: gateScriptPath,
+			env: map[string]string{
+				"PR_BODY":      "${{ github.event.pull_request.body }}",
+				"PR_AUTHOR":    "${{ github.event.pull_request.user.login }}",
+				"PR_NUMBER":    "${{ github.event.pull_request.number }}",
+				"PR_HEAD_REF":  "${{ github.event.pull_request.head.ref }}",
+				"PR_HEAD_REPO": "${{ github.event.pull_request.head.repo.full_name }}",
+				"PR_BASE_REPO": "${{ github.event.pull_request.base.repo.full_name }}",
+				"PR_HEAD_SHA":  "${{ github.event.pull_request.head.sha }}",
+			},
+		}
 	}
 
 	t.Fatalf("%s has no job named %q", gateWorkflowPath, requiredCheckContext)
@@ -133,7 +189,7 @@ func resolveEnv(t *testing.T, step gateStep, event pullRequestEvent) []string {
 	return out
 }
 
-// runGate executes the workflow step's shell exactly as the runner would, from
+// runGate executes the gate script exactly as release.yml does, from
 // the repository root, and reports whether the required check would pass.
 func runGate(t *testing.T, step gateStep, event pullRequestEvent) (bool, string) {
 	t.Helper()
@@ -437,6 +493,184 @@ func TestNoMistakesGateDecisions(t *testing.T) {
 			}
 		})
 	}
+}
+
+func loadReleaseGateStatusStep(t *testing.T) gateStep {
+	t.Helper()
+
+	data, err := os.ReadFile(releaseWorkflowPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", releaseWorkflowPath, err)
+	}
+	var wf workflowFile
+	if err := yaml.Unmarshal(data, &wf); err != nil {
+		t.Fatalf("parse %s: %v", releaseWorkflowPath, err)
+	}
+
+	job, ok := wf.Jobs["release-pr-gate-status"]
+	if !ok {
+		t.Fatal("release workflow has no release-pr-gate-status job")
+	}
+	if job.Permissions["statuses"] != "write" {
+		t.Fatalf("release-pr-gate-status statuses permission = %q, want write", job.Permissions["statuses"])
+	}
+	hasCheckout := false
+	var publishStep *gateStep
+	for _, step := range job.Steps {
+		if step.Uses == "actions/checkout@v4" {
+			hasCheckout = true
+		}
+		if step.Name == "Publish the no-mistakes gate status on the release PR" {
+			if strings.TrimSpace(step.Run) == "" {
+				t.Fatal("release gate status step has no executable run block")
+			}
+			publishStep = &gateStep{env: step.Env, run: step.Run}
+		}
+	}
+	if !hasCheckout {
+		t.Fatal("release-pr-gate-status must check out the repository before running its local gate script")
+	}
+	if publishStep != nil {
+		return *publishStep
+	}
+
+	t.Fatal("release workflow has no gate status publishing step")
+	return gateStep{}
+}
+
+func shellAssignment(name, value string) string {
+	return name + "='" + strings.ReplaceAll(value, "'", "'\\''") + "'"
+}
+
+func runReleaseGateStatusStep(t *testing.T, step gateStep, body string) (string, string) {
+	t.Helper()
+
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash not available; the release workflow runs on ubuntu-latest")
+	}
+
+	fakeBin := t.TempDir()
+	postLog := filepath.Join(t.TempDir(), "posts.log")
+	fakeGH := `#!/usr/bin/env bash
+set -euo pipefail
+case "$*" in
+  *"pulls?state=open"*)
+    echo 78
+    ;;
+  *"pulls/78"*)
+    printf '%s\n' "$GH_PULL_ASSIGNMENTS"
+    ;;
+  *"statuses/"*)
+    {
+      echo CALL
+      printf 'ARG=%s\n' "$@"
+    } >> "$GH_POST_LOG"
+    ;;
+  *)
+    echo "unexpected gh invocation: $*" >&2
+    exit 64
+    ;;
+esac
+`
+	fakeGHPath := filepath.Join(fakeBin, "gh")
+	if err := os.WriteFile(fakeGHPath, []byte(fakeGH), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+
+	assignments := []string{
+		shellAssignment("PR_NUMBER", "78"),
+		shellAssignment("PR_AUTHOR", "github-actions[bot]"),
+		shellAssignment("PR_HEAD_REF", "release-please--branches--main"),
+		shellAssignment("PR_HEAD_REPO", repo),
+		shellAssignment("PR_BASE_REPO", repo),
+		shellAssignment("PR_HEAD_SHA", attestationHeadSHA),
+		shellAssignment("PR_BODY", body),
+	}
+	values := map[string]string{
+		"GH_TOKEN":            "test-token",
+		"REPO":                repo,
+		"RUN_URL":             "https://example.invalid/actions/runs/123",
+		"GH_PULL_ASSIGNMENTS": strings.Join(assignments, " "),
+		"GH_POST_LOG":         postLog,
+		"PATH":                fakeBin + string(os.PathListSeparator) + os.Getenv("PATH"),
+	}
+	for _, name := range []string{"GH_TOKEN", "REPO", "RUN_URL"} {
+		if _, ok := step.env[name]; !ok {
+			t.Fatalf("release gate status step does not declare required environment input %q", name)
+		}
+	}
+	for name := range step.env {
+		if _, ok := values[name]; !ok {
+			t.Fatalf("release gate status step declares unhandled environment input %q", name)
+		}
+	}
+
+	cmd := exec.Command(bash, "-e", "-c", step.run)
+	for _, entry := range os.Environ() {
+		name, _, _ := strings.Cut(entry, "=")
+		if _, overridden := values[name]; !overridden && !strings.HasPrefix(name, "PR_") {
+			cmd.Env = append(cmd.Env, entry)
+		}
+	}
+	for name, value := range values {
+		cmd.Env = append(cmd.Env, name+"="+value)
+	}
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run release gate status step: %v\n%s", err, output)
+	}
+	log, err := os.ReadFile(postLog)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("read fake status writes: %v", err)
+	}
+	return string(output), string(log)
+}
+
+func TestReleaseWorkflowGateStatusWiring(t *testing.T) {
+	if filepath.Separator == '\\' {
+		t.Skip("release status step is an ubuntu-latest bash interface")
+	}
+	step := loadReleaseGateStatusStep(t)
+
+	t.Run("structural release PR stamps required context", func(t *testing.T) {
+		output, posts := runReleaseGateStatusStep(t, step, releaseBody)
+		for _, want := range []string{
+			"ARG=--method\nARG=POST",
+			"ARG=repos/" + repo + "/statuses/" + attestationHeadSHA,
+			"ARG=state=success",
+			"ARG=context=" + requiredCheckContext,
+			"ARG=target_url=https://example.invalid/actions/runs/123",
+		} {
+			if !strings.Contains(posts, want) {
+				t.Fatalf("status write missing %q\noutput:\n%s\nrecorded calls:\n%s", want, output, posts)
+			}
+		}
+	})
+
+	t.Run("bot identity alone cannot stamp required context", func(t *testing.T) {
+		output, posts := runReleaseGateStatusStep(t, step, "not a release-please body")
+		if posts != "" {
+			t.Fatalf("non-structural bot PR wrote a status:\n%s", posts)
+		}
+		if !strings.Contains(output, "not a structural release-please PR") {
+			t.Fatalf("missing rejection output:\n%s", output)
+		}
+	})
+
+	// Guard against accidentally widening this release-only path by exporting
+	// the head SHA; the omission itself is not endorsed here.
+	t.Run("attestation cannot widen structural release path", func(t *testing.T) {
+		output, posts := runReleaseGateStatusStep(t, step, noMistakesBody)
+		if posts != "" {
+			t.Fatalf("attestation-only release PR wrote a status:\n%s", posts)
+		}
+		for _, want := range []string{"pull request head:    (missing)", "not a structural release-please PR"} {
+			if !strings.Contains(output, want) {
+				t.Fatalf("missing rejection output %q:\n%s", want, output)
+			}
+		}
+	})
 }
 
 // The required check must always report on a pull request. A path filter would
