@@ -332,6 +332,35 @@ func mergeRefForWorktree(worktreePath string, context pruneContext) (string, err
 	return vcs.DefaultBranchMergeRefForWorktree(worktreePath, context.RepoRoot)
 }
 
+// headLandedOnItsBase gives a slot that the default ref reports unmerged a
+// second reading against the base it was cut from and parked on. A pool
+// configured with a base the default does not contain would otherwise have
+// every pristine slot classified as holding unlanded work, and neither prune
+// nor destroy could reclaim it.
+//
+// Only an explicitly requested base is ever recorded, so an empty field means
+// the pool never opted into base_branch, not that the recorded base happens
+// to equal the default. Consulting a base there anyway would quietly replace
+// the origin-validated default ref with whichever of local and origin
+// branchRef ranks higher, and start deleting slots parked on an unpushed
+// local default for pools that never opted in.
+//
+// It answers only a definitive "not merged": callers reach it after the
+// default-ref check succeeded, so an unverifiable slot keeps that check's
+// fail-closed classification, and an unrecorded, unresolvable, or
+// indistinguishable base reports false.
+func headLandedOnItsBase(worktreePath, baseBranch string) bool {
+	if baseBranch == "" {
+		return false
+	}
+	ref := vcs.BaseBranchMergeRef(worktreePath, baseBranch)
+	if ref == "" {
+		return false
+	}
+	merged, err := vcs.IsHeadMergedIntoRef(worktreePath, ref)
+	return err == nil && merged
+}
+
 func resolvePruneDefaultRef(repoRoot string) (string, error) {
 	if err := vcs.Fetch(repoRoot); err != nil {
 		return "", pruneVerificationError{
@@ -697,7 +726,7 @@ func analyzeIdleWorktree(resolveContext pruneContextResolver, wt WorktreeEntry, 
 		}
 		return worktree, skipped, true, context, nil
 	}
-	if !merged {
+	if !merged && !headLandedOnItsBase(worktree.Path, wt.BaseBranch) {
 		skipped = newPruneSkipped(wt.Name, wt.Path, PruneSkipUnmerged, fmt.Sprintf("HEAD not merged into %s", ref), "")
 		return worktree, skipped, true, context, nil
 	}

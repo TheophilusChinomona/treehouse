@@ -63,16 +63,18 @@ var statusCmd = &cobra.Command{
 			return writeStatusJSON(worktrees)
 		}
 
-		if len(worktrees) == 0 {
-			fmt.Fprintln(os.Stderr, "🌳 No worktrees in pool.")
-			return nil
-		}
-
 		green := color.New(color.FgGreen).SprintFunc()
 		red := color.New(color.FgRed).SprintFunc()
 		yellow := color.New(color.FgYellow).SprintFunc()
 		cyan := color.New(color.FgCyan, color.Bold).SprintFunc()
 		magenta := color.New(color.FgMagenta).SprintFunc()
+
+		fmt.Fprintln(os.Stdout, baseBranchLine(repoRoot, cfg, yellow))
+
+		if len(worktrees) == 0 {
+			fmt.Fprintln(os.Stderr, "🌳 No worktrees in pool.")
+			return nil
+		}
 
 		// statusWidth must be >= longest status string ("you're here" = 11)
 		const statusWidth = 11
@@ -123,6 +125,25 @@ var statusCmd = &cobra.Command{
 func init() {
 	statusCmd.Flags().BoolVar(&statusJSON, "json", false, "Print pool status as JSON")
 	rootCmd.AddCommand(statusCmd)
+}
+
+// baseBranchLine reports the branch worktrees are cut from. It never fails the
+// command: an unresolvable base is a finding to report, not a status error.
+// Human output only; status --json is a top-level array and stays one.
+func baseBranchLine(repoRoot string, cfg config.Config, warn func(a ...interface{}) string) string {
+	const prefix = "base  "
+	if cfg.BaseBranch == "" {
+		branch, err := vcs.GetDefaultBranch(repoRoot)
+		if err != nil {
+			return prefix + warn(fmt.Sprintf("cannot be determined (%v)", err))
+		}
+		return prefix + branch + "  (repository default)"
+	}
+	if err := vcs.VerifyBaseBranch(repoRoot, cfg.BaseBranch); err != nil {
+		// Short: this sits above a table, and get prints the full diagnosis.
+		return prefix + cfg.BaseBranch + warn("  (configured, but cannot be resolved — 'treehouse get' will fail)")
+	}
+	return prefix + cfg.BaseBranch + "  (configured)"
 }
 
 func writeStatusJSON(worktrees []pool.WorktreeStatus) error {

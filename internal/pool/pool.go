@@ -46,6 +46,10 @@ type LeaseInfo struct {
 	LeaseID     string    `json:"lease_id"`
 	LeaseHolder string    `json:"lease_holder"`
 	LeasedAt    time.Time `json:"leased_at"`
+	// BaseBranch is the branch this acquisition was cut from, explicit or
+	// inferred. Always populated, never persisted: it describes one
+	// acquisition, and the next reset resolves the branch again.
+	BaseBranch string `json:"base_branch"`
 }
 
 // AcquireOptions controls optional acquisition behavior.
@@ -53,12 +57,18 @@ type AcquireOptions struct {
 	// SkipFetch uses the repository's existing local refs instead of fetching
 	// origin before acquiring a worktree.
 	SkipFetch bool
+	// BaseBranch overrides the branch worktrees are cut from. Empty keeps the
+	// branch inferred from the repository. A non-empty value that cannot be
+	// resolved fails the acquisition rather than falling back.
+	BaseBranch string
 }
 
 // acquireOptions controls how Acquire reserves the worktree it hands out.
 type acquireOptions struct {
 	// skipFetch uses existing local refs without contacting origin.
 	skipFetch bool
+	// baseBranch is the explicitly requested base branch, or empty to infer it.
+	baseBranch string
 	// lease records a durable, process-independent reservation instead of the
 	// default short-lived owner reservation.
 	lease bool
@@ -81,6 +91,7 @@ func Acquire(repoRoot, poolDir string, poolSize int, postCreate []string) (strin
 func AcquireWithOptions(repoRoot, poolDir string, poolSize int, postCreate []string, options AcquireOptions) (string, error) {
 	acquired, err := acquire(repoRoot, poolDir, poolSize, postCreate, acquireOptions{
 		skipFetch:  options.SkipFetch,
+		baseBranch: options.BaseBranch,
 		hookStdout: os.Stdout,
 		hookStderr: os.Stderr,
 	})
@@ -107,6 +118,7 @@ func AcquireLeaseInfo(repoRoot, poolDir string, poolSize int, postCreate []strin
 func AcquireLeaseInfoWithOptions(repoRoot, poolDir string, poolSize int, postCreate []string, holder string, options AcquireOptions) (LeaseInfo, error) {
 	return acquire(repoRoot, poolDir, poolSize, postCreate, acquireOptions{
 		skipFetch:   options.SkipFetch,
+		baseBranch:  options.BaseBranch,
 		lease:       true,
 		leaseHolder: holder,
 		hookStdout:  os.Stderr,
@@ -115,16 +127,18 @@ func AcquireLeaseInfoWithOptions(repoRoot, poolDir string, poolSize int, postCre
 }
 
 func acquire(repoRoot, poolDir string, poolSize int, postCreate []string, opts acquireOptions) (LeaseInfo, error) {
-	branch, err := vcs.GetDefaultBranch(repoRoot)
-	if err != nil {
-		return LeaseInfo{}, err
-	}
-
 	fmt.Fprintf(os.Stderr, "🌳 Setting up worktree...\n")
 	if !opts.skipFetch && vcs.HasRemote(repoRoot, "origin") {
 		if err := vcs.Fetch(repoRoot); err != nil {
 			return LeaseInfo{}, fmt.Errorf("fetch failed: %w", err)
 		}
+	}
+
+	// After the fetch, not before: a base that exists only on origin would be
+	// rejected against pre-fetch refs.
+	branch, err := resolveBaseBranch(repoRoot, opts.baseBranch)
+	if err != nil {
+		return LeaseInfo{}, err
 	}
 
 	var acquired LeaseInfo
@@ -182,7 +196,10 @@ func acquire(repoRoot, poolDir string, poolSize int, postCreate []string, opts a
 				continue
 			}
 			safe, resetRef, head, err := vcs.IsWorktreeSafeToReset(wt.Path, branch)
-			if err != nil || !safe {
+			if err != nil {
+				continue
+			}
+			if !safe && !headMergedIntoRecordedBase(wt, branch, head) {
 				continue
 			}
 			// Found an available one. Reset it to the verified commit only if
@@ -191,10 +208,11 @@ func acquire(repoRoot, poolDir string, poolSize int, postCreate []string, opts a
 			if err := vcs.ResetWorktreeToRef(wt.Path, resetRef, head, true); err != nil {
 				continue
 			}
+			state.Worktrees[i].BaseBranch = opts.baseBranch
 			if err := markAcquired(&state.Worktrees[i], opts); err != nil {
 				return err
 			}
-			acquired = leaseInfoFromEntry(state.Worktrees[i])
+			acquired = leaseInfoFromEntry(state.Worktrees[i], branch)
 			if err := WriteState(poolDir, state); err != nil {
 				return err
 			}
@@ -237,16 +255,17 @@ func acquire(repoRoot, poolDir string, poolSize int, postCreate []string, opts a
 		}
 
 		entry := WorktreeEntry{
-			Name:      name,
-			Path:      wtPath,
-			CreatedAt: time.Now(),
+			Name:       name,
+			Path:       wtPath,
+			CreatedAt:  time.Now(),
+			BaseBranch: opts.baseBranch,
 		}
 		if err := markAcquired(&entry, opts); err != nil {
 			return err
 		}
 		state.Worktrees = append(state.Worktrees, entry)
 
-		acquired = leaseInfoFromEntry(entry)
+		acquired = leaseInfoFromEntry(entry, branch)
 		if err := WriteState(poolDir, state); err != nil {
 			return err
 		}
@@ -263,13 +282,68 @@ func acquire(repoRoot, poolDir string, poolSize int, postCreate []string, opts a
 	return acquired, nil
 }
 
-func leaseInfoFromEntry(wt WorktreeEntry) LeaseInfo {
+func leaseInfoFromEntry(wt WorktreeEntry, baseBranch string) LeaseInfo {
 	return LeaseInfo{
 		Path:        wt.Path,
 		LeaseID:     wt.LeaseID,
 		LeaseHolder: wt.LeaseHolder,
 		LeasedAt:    wt.LeasedAt,
+		BaseBranch:  baseBranch,
 	}
+}
+
+// headMergedIntoRecordedBase reports whether a slot carries nothing beyond the
+// base it was parked on. Acquisitions that mix bases would otherwise wedge the
+// pool: a slot returned to develop is not merged into main, so a later plain
+// get skips it and builds a new slot until max_trees, with nothing able to
+// reclaim it. Work that only exists in the slot's own base is as disposable as
+// work in the requested one; a slot holding commits beyond it is not, and is
+// still skipped.
+//
+// An entry written before base_branch existed, and any inferred acquisition,
+// records no base, so the repository default stands in as its implicit base
+// HERE ONLY: prune and destroy deliberately give such a slot no second
+// reading and stay on the origin-validated default ref. The asymmetry is
+// safe because acquire only RESETS a slot whose HEAD stays reachable from a
+// local branch, while prune and destroy DELETE and so must stay conservative
+// - which is exactly what keeps non-opt-in pools on the pre-feature deletion
+// semantics.
+//
+// Fails closed on an unresolvable base, an errored check, and a HEAD that moved
+// between the two readings. A base equal to the requested branch answers false
+// without asking git again: the caller reaches this only after that same query
+// returned unsafe.
+func headMergedIntoRecordedBase(wt WorktreeEntry, requested, head string) bool {
+	base := wt.BaseBranch
+	if base == "" {
+		resolved, err := vcs.DefaultBranchForWorktree(wt.Path)
+		if err != nil {
+			return false
+		}
+		base = resolved
+	}
+	if base == requested {
+		return false
+	}
+	safe, _, recordedHead, err := vcs.IsWorktreeSafeToReset(wt.Path, base)
+	return err == nil && safe && recordedHead == head
+}
+
+// resolveBaseBranch picks the branch worktrees are cut from and reset to: the
+// explicitly requested one, otherwise the inferred default.
+//
+// Only an explicit request is verified. GetDefaultBranch already errors when it
+// cannot answer, but an unverified explicit branch would not surface at all:
+// acquire SKIPS a slot whose safety check fails, so a typo would look like a
+// pool with nothing reusable and burn a fresh slot per call.
+func resolveBaseBranch(repoRoot, requested string) (string, error) {
+	if requested == "" {
+		return vcs.GetDefaultBranch(repoRoot)
+	}
+	if err := vcs.VerifyBaseBranch(repoRoot, requested); err != nil {
+		return "", err
+	}
+	return requested, nil
 }
 
 // markAcquired stamps an acquired worktree entry: a durable lease in lease mode,
@@ -307,7 +381,7 @@ type ReleasePreconditions struct {
 // durable lease, and returns it to the available pool. It retains the legacy
 // unconditional behavior of releasing by path.
 func Release(poolDir, worktreePath string) error {
-	return ReleaseConditional(poolDir, worktreePath, ReleasePreconditions{}, nil)
+	return ReleaseConditional(poolDir, worktreePath, "", ReleasePreconditions{}, nil)
 }
 
 // ValidateReleasePreconditions checks that a managed worktree still matches
@@ -332,15 +406,20 @@ func ValidateReleasePreconditions(poolDir, worktreePath string, preconditions Re
 // in an in-project pool resolves the repository ENCLOSING the pool. Its
 // reservation is still cleared so the slot is not stuck leased, and the damaged
 // slot is left for destroy; acquire refuses to reuse it.
-func ReleaseConditional(poolDir, worktreePath string, preconditions ReleasePreconditions, beforeReset func() error) error {
+//
+// baseBranch parks the returned slot on the branch the pool cuts from; empty
+// falls back to the base the slot was acquired with, then to the inferred
+// default. Parking is what keeps the slot reusable: acquire recycles only when
+// HEAD is merged into the base it resets to, so a slot parked off-base is never
+// recycled and every acquire grows the pool until max_trees.
+func ReleaseConditional(poolDir, worktreePath, baseBranch string, preconditions ReleasePreconditions, beforeReset func() error) error {
 	markerless := vcs.WorktreeBackendName(worktreePath) == ""
-	branch := ""
+	// Resolved before the state lock so a failure surfaces before beforeReset
+	// kills the worktree's processes. It is only fatal when the slot has no
+	// base of its own to park on instead.
+	defaultBranch, defaultErr := "", error(nil)
 	if !markerless {
-		resolved, err := vcs.DefaultBranchForWorktree(worktreePath)
-		if err != nil {
-			return err
-		}
-		branch = resolved
+		defaultBranch, defaultErr = vcs.DefaultBranchForWorktree(worktreePath)
 	}
 	return WithStateLock(poolDir, func() error {
 		state, err := ReadState(poolDir)
@@ -352,6 +431,20 @@ func ReleaseConditional(poolDir, worktreePath string, preconditions ReleasePreco
 		if err != nil {
 			return err
 		}
+		branch, fallback, requested := "", "", ""
+		if !markerless {
+			requested = baseBranch
+			if requested == "" {
+				requested = wt.BaseBranch
+			}
+			if defaultErr != nil && requested == "" {
+				return defaultErr
+			}
+			branch, fallback = defaultBranch, defaultBranch
+			if requested != "" {
+				branch = requested
+			}
+		}
 		if beforeReset != nil {
 			if err := beforeReset(); err != nil {
 				return err
@@ -359,8 +452,20 @@ func ReleaseConditional(poolDir, worktreePath string, preconditions ReleasePreco
 		}
 		if !markerless {
 			if err := vcs.ResetWorktree(worktreePath, branch); err != nil {
-				return err
+				// The base resolved when the caller checked it but not now (it
+				// was deleted in between). Park on the default rather than
+				// strand the reservation with the processes already killed.
+				if fallback == "" || fallback == branch {
+					return err
+				}
+				fmt.Fprintf(os.Stderr, "🌳 Warning: cannot park the worktree on %q (%v); using %s instead.\n", branch, err, fallback)
+				if err := vcs.ResetWorktree(worktreePath, fallback); err != nil {
+					return err
+				}
+				branch = fallback
+				requested = ""
 			}
+			wt.BaseBranch = requested
 		}
 
 		wt.OwnerPID = 0

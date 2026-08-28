@@ -266,6 +266,30 @@ func GetRemoteURL(repoRoot string) (string, error) {
 	return backendFor(repoRoot).GetRemoteURL(repoRoot)
 }
 
+// VerifyBaseBranch checks that an explicitly requested base branch resolves,
+// before anything is created or reset. An unresolvable base is an error rather
+// than a fallback to the inferred default, which would hand back a worktree cut
+// from the wrong branch and report success.
+//
+// It deliberately sits outside the Backend interface. An explicit base is a
+// git-only opt-in for now: jj's own branchRef looks generic enough that the
+// path would probably work, but it has never been exercised, and a Backend
+// method would put an unverified implementation on the destructive path and
+// then leave it dead behind this refusal.
+func VerifyBaseBranch(repoRoot, branch string) error {
+	if branch == "" {
+		return nil
+	}
+	backend := backendFor(repoRoot)
+	if backend.Name() != "git" {
+		return fmt.Errorf("an explicit base branch is only supported by the git backend, but this repository selects %s; remove base_branch (or --base) to use the inferred default bookmark", backend.Name())
+	}
+	if !gitvcs.BranchExists(repoRoot, branch) {
+		return fmt.Errorf("base branch %q does not exist: no local branch %s and no remote-tracking branch origin/%s (fetch first, or fix base_branch/--base)", branch, branch, branch)
+	}
+	return nil
+}
+
 // AddWorktree creates a new worktree at path based on branch.
 func AddWorktree(repoRoot, path, branch string) error {
 	return backendFor(repoRoot).AddWorktree(repoRoot, path, branch)
@@ -389,6 +413,23 @@ func DefaultBranchMergeRef(repoRoot string) (string, error) {
 // against; the configured backend's ref never parses for it.
 func DefaultBranchMergeRefForWorktree(worktreePath, repoRoot string) (string, error) {
 	return backendForWorktree(worktreePath).DefaultBranchMergeRef(repoRoot)
+}
+
+// BaseBranchMergeRef returns the fully qualified ref for the base a pooled slot
+// records having been cut from, or "" when that base cannot be named and the
+// caller should keep the repository default ref. Git-only for the same reason
+// as VerifyBaseBranch: an explicit base is a git opt-in, and a jj slot's
+// recorded base is its own default bookmark anyway.
+func BaseBranchMergeRef(worktreePath, branch string) string {
+	if branch == "" || WorktreeBackendName(worktreePath) != "git" {
+		return ""
+	}
+	b := backendForWorktree(worktreePath)
+	repoRoot, err := b.FindRepoRootFrom(worktreePath)
+	if err != nil {
+		return ""
+	}
+	return gitvcs.BranchMergeRef(repoRoot, branch)
 }
 
 // DefaultBranchForWorktree returns the default branch of the repository that

@@ -130,6 +130,10 @@ func refExists(repoRoot, ref string) bool {
 // branchRef returns whichever of the local branch or remote-tracking branch is
 // further ahead. If they have diverged (neither is an ancestor of the other),
 // it prefers origin. Falls back to whichever ref exists.
+//
+// Both are returned fully qualified. A bare branch name would let git's
+// disambiguation pick refs/tags/<name>, which it ranks above refs/heads/<name>,
+// and silently cut the worktree from a same-named tag.
 func branchRef(repoRoot, branch string) string {
 	local := "refs/heads/" + branch
 	remote := remoteTrackingRef("origin", branch)
@@ -145,14 +149,46 @@ func branchRef(repoRoot, branch string) string {
 		// Otherwise local is ahead or they diverged; prefer local when
 		// it's strictly ahead, prefer remote on divergence.
 		if isAncestor(repoRoot, remote, local) {
-			return branch
+			return local
 		}
 		return remote
 	case hasLocal:
-		return branch
+		return local
 	default:
 		return remote
 	}
+}
+
+// BranchExists reports whether branch names refs/heads/<branch> or
+// refs/remotes/origin/<branch>, the two refs branchRef chooses between.
+//
+// It looks the refs up EXACTLY rather than through rev-parse --verify, which
+// resolves revision expressions: refs/heads/<b>^, ~3 and @{0} all verify under
+// rev-parse, so the prefixes alone would accept a pinned commit as a base and
+// persist the expression as the slot's recorded base. HEAD is rejected by name
+// because git clone writes refs/remotes/origin/HEAD. An unreadable repository
+// reports every branch as missing, which fails closed.
+func BranchExists(repoRoot, branch string) bool {
+	if branch == "" || branch == "HEAD" {
+		return false
+	}
+	return exactRefExists(repoRoot, "refs/heads/"+branch) ||
+		exactRefExists(repoRoot, remoteTrackingRef("origin", branch))
+}
+
+func exactRefExists(repoRoot, ref string) bool {
+	_, err := runGit(repoRoot, "show-ref", "--verify", "--quiet", ref)
+	return err == nil
+}
+
+// BranchMergeRef returns the fully qualified ref merge-safety checks should
+// compare against for branch, or "" when branch names no local or
+// remote-tracking branch.
+func BranchMergeRef(repoRoot, branch string) string {
+	if !BranchExists(repoRoot, branch) {
+		return ""
+	}
+	return branchRef(repoRoot, branch)
 }
 
 func remoteTrackingRef(remote, branch string) string {

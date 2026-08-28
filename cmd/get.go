@@ -23,6 +23,7 @@ var (
 	getLeaseHolder string
 	getJSON        bool
 	getNoFetch     bool
+	getBase        string
 )
 
 // Process seams, overridable in tests, matching the pattern in internal/pool.
@@ -41,7 +42,14 @@ worktree and marks it leased in persistent state. By default it prints only the
 absolute path to stdout; add --json for the lease identity and metadata. All
 banners go to stderr. A leased worktree is never handed out by a later get and
 never removed by prune, even with no process running inside it, until you release
-it with 'treehouse return <path>'.`,
+it with 'treehouse return <path>'.
+
+Worktrees are cut from the branch treehouse infers from the repository. Pass
+--base to cut this one from a different branch, or set base_branch in
+treehouse.toml to change it for the whole pool. The worktree is still handed
+over in detached HEAD; --base chooses the commit it starts at, it does not
+create or check out a branch. A base that cannot be resolved is an error, never
+a silent fall back to the inferred default.`,
 	RunE: getRunE,
 }
 
@@ -50,6 +58,8 @@ func init() {
 	getCmd.Flags().StringVar(&getLeaseHolder, "lease-holder", "", "Optional label recorded as the lease holder (defaults to $TREEHOUSE_LEASE_HOLDER)")
 	getCmd.Flags().BoolVar(&getJSON, "json", false, "Print lease allocation as JSON (requires --lease)")
 	getCmd.Flags().BoolVar(&getNoFetch, "no-fetch", false, "Skip fetching origin before acquiring; use existing local refs")
+	// No -b shorthand: git spells branch creation -b, and this creates nothing.
+	getCmd.Flags().StringVar(&getBase, "base", "", "Branch to cut this worktree from, overriding base_branch in config (default: inferred from the repository)")
 	rootCmd.AddCommand(getCmd)
 }
 
@@ -86,7 +96,8 @@ func getRunE(cmd *cobra.Command, args []string) error {
 	}
 
 	wtPath, err := pool.AcquireWithOptions(repoRoot, poolDir, cfg.MaxTrees, cfg.Hooks.PostCreate, pool.AcquireOptions{
-		SkipFetch: getNoFetch,
+		SkipFetch:  getNoFetch,
+		BaseBranch: resolveRequestedBase(cfg),
 	})
 	if err != nil {
 		return err
@@ -120,7 +131,7 @@ func getRunE(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	if err := returnWorktreeToPool(poolDir, wtPath); err != nil {
+	if err := returnWorktreeToPool(poolDir, wtPath, releaseBaseBranch(repoRoot, cfg)); err != nil {
 		fmt.Fprintf(os.Stderr, "🌳 Warning: %v; leaving worktree in place.\n", err)
 		return err
 	}
@@ -134,10 +145,35 @@ func getRunE(cmd *cobra.Command, args []string) error {
 // as the release's beforeReset step, under the same state lock and immediately
 // before the reset, so a writer that re-enters the worktree cannot slip between
 // the emptiness check and the destructive reset.
-func returnWorktreeToPool(poolDir, wtPath string) error {
-	return pool.ReleaseConditional(poolDir, wtPath, pool.ReleasePreconditions{}, func() error {
+func returnWorktreeToPool(poolDir, wtPath, baseBranch string) error {
+	return pool.ReleaseConditional(poolDir, wtPath, baseBranch, pool.ReleasePreconditions{}, func() error {
 		return killLingeringProcesses(wtPath)
 	})
+}
+
+// resolveRequestedBase returns the base this invocation asks for: the --base
+// flag, then base_branch from config, then empty to infer it.
+func resolveRequestedBase(cfg config.Config) string {
+	if getBase != "" {
+		return getBase
+	}
+	return cfg.BaseBranch
+}
+
+// releaseBaseBranch returns the branch a returned worktree is parked on: the
+// configured base, or "" for the repository default. It reads config rather
+// than this invocation's --base because parking decides what the NEXT acquire
+// can recycle. An unresolvable base warns and falls back, so a typo cannot
+// strand the reservation; get reports it as a real error.
+func releaseBaseBranch(repoRoot string, cfg config.Config) string {
+	if cfg.BaseBranch == "" {
+		return ""
+	}
+	if err := vcs.VerifyBaseBranch(repoRoot, cfg.BaseBranch); err != nil {
+		fmt.Fprintf(os.Stderr, "🌳 Warning: cannot return the worktree to base branch %q (%v); using the repository default instead.\n", cfg.BaseBranch, err)
+		return ""
+	}
+	return cfg.BaseBranch
 }
 
 // getLeaseRunE performs a non-interactive, durable acquire. It writes either the
@@ -150,7 +186,8 @@ func getLeaseRunE(repoRoot, poolDir string, cfg config.Config) error {
 	}
 
 	lease, err := pool.AcquireLeaseInfoWithOptions(repoRoot, poolDir, cfg.MaxTrees, cfg.Hooks.PostCreate, holder, pool.AcquireOptions{
-		SkipFetch: getNoFetch,
+		SkipFetch:  getNoFetch,
+		BaseBranch: resolveRequestedBase(cfg),
 	})
 	if err != nil {
 		return err

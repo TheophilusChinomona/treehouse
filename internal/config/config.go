@@ -12,6 +12,11 @@ import (
 type Config struct {
 	MaxTrees int    `toml:"max_trees"`
 	Root     string `toml:"root"`
+	// BaseBranch names the branch new and recycled worktrees are cut from.
+	// Empty (the default) infers it from the repository. When set, an
+	// unresolvable branch fails the acquisition instead of falling back.
+	// Overridden per invocation by `treehouse get --base`.
+	BaseBranch string `toml:"base_branch,omitempty"`
 	// VCS selects the version-control backend. Git is the default
 	// everywhere; set "jj" to opt in to the Jujutsu backend. The vcs
 	// package parses the config files itself at backend selection time
