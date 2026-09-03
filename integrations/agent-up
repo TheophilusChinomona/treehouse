@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+#
+# agent-up — run an AI coding agent inside a fresh treehouse worktree.
+#
+# Acquires a durable treehouse lease, launches the named agent with the
+# worktree as its working directory, then runs the agent-down policy when the
+# agent exits. The worktree therefore lives exactly as long as the agent
+# session: once the agent's PR work is merged, the slot is reclaimed; if the
+# work has not provably landed, the lease is kept and the worktree is reported
+# so nothing is silently discarded.
+#
+# Usage:
+#   agent-up <agent> [--] [prompt-or-args...]
+#
+#   <agent>   Name of a configured agent: "cmd", "claude", "hermes", or a
+#             bare executable name found on PATH. The display label recorded
+#             as the lease holder is the agent name.
+#
+# Environment / config:
+#   TREEHOUSE_BIN        treehouse binary (default: "treehouse" on PATH)
+#   TREEHOUSE_BASE       branch to cut the worktree from (empty = inferred)
+#   TREEHOUSE_LEASE_DIR  where lease state is cached (default: /tmp/...)
+#   TREEHOUSE_NO_SWEEP   set to skip the auto-down policy on exit (keep lease)
+#   TREEHOUSE_KEEP       alias of TREEHOUSE_NO_SWEEP
+#
+# Agent launch overrides (an env var per agent, empty = run the agent's CLI
+# binary directly):
+#   CMD_LAUNCH / CLAUDE_LAUNCH / HERMES_LAUNCH
+#
+# Exit status: the agent's own exit status when it ran; non-zero when
+# acquisition failed. The down policy's own failures are warnings, not errors.
+set -euo pipefail
+
+# --- resolve treehouse -------------------------------------------------------
+TREEHOUSE_BIN="${TREEHOUSE_BIN:-treehouse}"
+if ! command -v "$TREEHOUSE_BIN" >/dev/null 2>&1; then
+  echo "agent-up: $TREEHOUSE_BIN not found on PATH (set TREEHOUSE_BIN)" >&2
+  exit 127
+fi
+
+# --- parse args --------------------------------------------------------------
+if [[ $# -lt 1 ]]; then
+  echo "usage: agent-up <agent> [--] [prompt-or-args...]" >&2
+  exit 2
+fi
+agent="$1"
+shift
+# Allow an explicit "--" separator between the agent name and its args.
+if [[ "${1:-}" == "--" ]]; then shift; fi
+
+case "$agent" in
+  cmd|claude|hermes)
+    holder="$agent"
+    ;;
+  *)
+    # Bare executable name: use its basename as the lease holder.
+    holder="$(basename "$agent")"
+    ;;
+esac
+
+# --- locate the repository (for the treehouse pool) -------------------------
+# Run from the caller's checkout (the main repo, not a worktree). Resolve the
+# main repository root the same way treehouse does, and cd there so
+# `treehouse get` and the lease both attach to the owning repository.
+if ! git rev-parse --show-toplevel >/dev/null 2>&1; then
+  echo "agent-up: not inside a git repository" >&2
+  exit 2
+fi
+# treehouse treats the checkout root (or its containing repo) as the repo.
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd "$repo_root"
+
+# --- acquire a durable lease -------------------------------------------------
+lease_args=(get --lease --lease-holder "$holder" --json)
+if [[ -n "${TREEHOUSE_BASE:-}" ]]; then
+  lease_args+=(--base "$TREEHOUSE_BASE")
+fi
+
+lease_json="$("$TREEHOUSE_BIN" "${lease_args[@]}")"
+wt_path="$(printf '%s' "$lease_json" | sed -n 's/.*"path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+lease_id="$(printf '%s' "$lease_json" | sed -n 's/.*"lease_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+if [[ -z "$wt_path" || -z "$lease_id" ]]; then
+  echo "agent-up: could not parse treehouse lease output:" >&2
+  printf '%s\n' "$lease_json" >&2
+  exit 1
+fi
+
+# Persist the lease identity for agent-down and for diagnostics. Use a
+# per-holder path so concurrent agents never overwrite each other.
+lease_dir="${TREEHOUSE_LEASE_DIR:-${TMPDIR:-/tmp}/treehouse-agent}"
+mkdir -p "$lease_dir"
+lease_file="$lease_dir/${holder}.lease"
+printf 'path=%s\nlease_id=%s\nholder=%s\nrepo=%s\n' \
+  "$wt_path" "$lease_id" "$holder" "$repo_root" > "$lease_file"
+
+# --- run the agent inside the worktree ---------------------------------------
+# Resolve the launcher: an explicit override wins; otherwise the agent's CLI
+# binary is run directly (interactive). If only a prompt was given and the
+# agent supports a "-p" print mode, the caller may pass it as args themselves.
+launcher_env="${agent^^}_LAUNCH"
+launcher="${!launcher_env:-}"
+if [[ -z "$launcher" ]]; then
+  case "$agent" in
+    cmd)     launcher="cmd" ;;
+    claude)  launcher="claude" ;;
+    hermes)  launcher="hermes" ;;
+    *)       launcher="$agent" ;;
+  esac
+fi
+if ! command -v "$launcher" >/dev/null 2>&1; then
+  echo "agent-up: launcher '$launcher' for agent '$agent' not found on PATH (set ${launcher_env})" >&2
+  # Do not discard the leased worktree on launch failure: report and exit.
+  echo "agent-up: leaving leased worktree at $wt_path (lease $lease_id)" >&2
+  exit 127
+fi
+
+echo "agent-up: $agent running in $wt_path (lease $lease_id)" >&2
+set +e
+( cd "$wt_path" && exec "$launcher" "$@" )
+agent_status=$?
+set -e
+
+# --- down policy -------------------------------------------------------------
+if [[ -n "${TREEHOUSE_NO_SWEEP:-}${TREEHOUSE_KEEP:-}" ]]; then
+  echo "agent-up: TREEHOUSE_NO_SWEEP set — keeping lease on $wt_path" >&2
+  exit "$agent_status"
+fi
+
+# Re-resolve the treehouse binary; the agent may have changed PATH.
+if ! command -v "$TREEHOUSE_BIN" >/dev/null 2>&1; then
+  echo "agent-up: warning: $TREEHOUSE_BIN unavailable after agent exit; keeping lease on $wt_path" >&2
+  exit "$agent_status"
+fi
+
+down_status=0
+# Resolve agent-down next to this script so it works even when the
+# integrations dir is not on PATH.
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+"$here/agent-down" "$holder" "$agent_status" || down_status=$?
+if [[ $down_status -ne 0 ]]; then
+  echo "agent-up: warning: down policy exited $down_status; lease kept on $wt_path" >&2
+fi
+exit "$agent_status"

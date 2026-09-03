@@ -1,0 +1,161 @@
+#!/usr/bin/env bash
+#
+# agent-down — tear down an agent's treehouse worktree once its work has
+# provably landed (its HEAD is merged into the base branch), or keep it and
+# report where it is when the work has NOT provably landed.
+#
+# This is the "down" half of the lifecycle started by agent-up. It is also
+# safe to run standalone against a cached lease, and its merge logic is what a
+# scheduled sweep (see README) relies on: it never auto-returns or deletes a
+# worktree whose commits are not merged into the base — that would discard an
+# open PR or local-only work.
+#
+# Usage:
+#   agent-down <agent> [expected-exit-status]
+#     <agent>               the lease holder (matches the cached lease file).
+#     expected-exit-status  the agent's exit status; non-zero means the agent
+#                           did not finish cleanly and we keep the lease.
+#
+# Environment:
+#   TREEHOUSE_BIN   treehouse binary (default: "treehouse" on PATH)
+#   TREEHOUSE_LEASE_DIR  where the cached lease file lives
+#   TREEHOUSE_DRY_RUN   set to skip the actual return/destroy, only report
+#   TREEHOUSE_KEEP      set to always keep the lease (never tear down)
+#
+# Exit status:
+#   0  the worktree was torn down (returned to the pool, or reclaimed after
+#      merge), or was kept deliberately (unmerged work / dry run).
+#   1  the down policy could not determine the state and left the lease in
+#      place.
+set -euo pipefail
+
+TREEHOUSE_BIN="${TREEHOUSE_BIN:-treehouse}"
+lease_dir="${TREEHOUSE_LEASE_DIR:-${TMPDIR:-/tmp}/treehouse-agent}"
+
+usage() {
+  echo "usage: agent-down <agent> [expected-exit-status]" >&2
+  exit 2
+}
+[[ $# -ge 1 ]] || usage
+agent="$1"
+expected_status="${2:-0}"
+
+if ! command -v "$TREEHOUSE_BIN" >/dev/null 2>&1; then
+  echo "agent-down: $TREEHOUSE_BIN not found (set TREEHOUSE_BIN)" >&2
+  exit 1
+fi
+
+lease_file="$lease_dir/${agent}.lease"
+if [[ ! -f "$lease_file" ]]; then
+  echo "agent-down: no cached lease for '$agent' at $lease_file; nothing to tear down" >&2
+  exit 1
+fi
+
+# Load cached lease identity.
+wt_path="$(sed -n 's/^path=//p' "$lease_file" | tail -1)"
+lease_id="$(sed -n 's/^lease_id=//p' "$lease_file" | tail -1)"
+repo="$(sed -n 's/^repo=//p' "$lease_file" | tail -1)"
+if [[ -z "$wt_path" || -z "$lease_id" ]]; then
+  echo "agent-down: cached lease for '$agent' is missing path or lease_id" >&2
+  exit 1
+fi
+
+# An agent that exited non-zero did not finish cleanly: keep the lease and
+# report, never tear down. Callers may override by clearing expected_status.
+if [[ "$expected_status" != "0" ]]; then
+  echo "agent-down: agent exited $expected_status; keeping lease on $wt_path" >&2
+  exit 0
+fi
+
+if [[ -n "${TREEHOUSE_KEEP:-}" ]]; then
+  echo "agent-down: TREEHOUSE_KEEP set; keeping lease on $wt_path" >&2
+  exit 0
+fi
+
+# The worktree must still exist and be the one we leased.
+if [[ ! -d "$wt_path" ]]; then
+  echo "agent-down: leased worktree $wt_path no longer exists; clearing cache" >&2
+  rm -f "$lease_file"
+  exit 0
+fi
+
+# --- is the worktree dirty? --------------------------------------------------
+# A dirty tree means the agent left uncommitted changes. treehouse would reset
+# them away on return and destroy would refuse them without --include-unlanded.
+# Either way this is not a clean post-merge teardown, so keep and report.
+if ! git -C "$wt_path" diff --quiet 2>/dev/null || ! git -C "$wt_path" diff --cached --quiet 2>/dev/null; then
+  echo "agent-down: $wt_path has uncommitted changes; keeping lease (run 'treehouse return $wt_path --force' to discard them)" >&2
+  exit 0
+fi
+# Untracked files also count as dirt for treehouse (it treats untracked as
+# dirty even when git config hides them from status). Mirror that here.
+if [[ -n "$(git -C "$wt_path" ls-files --others --exclude-standard 2>/dev/null | head -1)" ]]; then
+  echo "agent-down: $wt_path has untracked files; keeping lease (run 'treehouse return $wt_path --force' to discard them)" >&2
+  exit 0
+fi
+
+# --- resolve the branch this worktree's HEAD points at -----------------------
+# treehouse keeps worktrees in detached HEAD, so the branch is found from the
+# worktree registration (the .git file points at the repo's worktree metadata,
+# whose HEAD names the branch). A missing registration means no branch was ever
+# created — nothing to merge, so keep and report.
+branch="$(git -C "$wt_path" symbolic-ref --short HEAD 2>/dev/null || true)"
+if [[ -z "$branch" ]]; then
+  echo "agent-down: $wt_path is not on a branch (detached, no registered branch); keeping lease" >&2
+  exit 0
+fi
+
+# --- merge check -------------------------------------------------------------
+# The work may have been pushed/merged since the session ended. Refresh origin
+# (best-effort) and prove ancestry: HEAD merged into origin/<base> means the PR
+# landed and the tree is safe to reclaim. If origin is unreachable we keep the
+# lease (mirrors treehouse's own "origin unreachable ⇒ cannot verify" rule).
+# Run git against the worktree so the branch and the repo's origin refs are in
+# the same object store as the lease.
+base_branch="${TREEHOUSE_BASE:-}"
+if [[ -z "$base_branch" ]]; then
+  # Infer the base the way treehouse does: origin/HEAD (the remote default).
+  # symbolic-ref needs a full ref; strip the origin/ prefix.
+  base_branch="$(
+    git -C "$wt_path" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null \
+      | sed 's#^origin/##'
+  )"
+fi
+if [[ -z "$base_branch" ]]; then
+  # No origin/HEAD (fresh clone or bare remote): fall back to the main
+  # checkout's current branch.
+  base_branch="$(git -C "$repo" symbolic-ref --short HEAD 2>/dev/null | sed 's#^refs/heads/##' || true)"
+fi
+if [[ -z "$base_branch" ]]; then
+  echo "agent-down: could not determine the base branch for $wt_path; keeping lease" >&2
+  exit 1
+fi
+
+if ! git -C "$wt_path" fetch origin "$base_branch" --quiet 2>/dev/null; then
+  echo "agent-down: could not fetch origin/$base_branch (offline?); keeping lease on $wt_path (work not verified as merged)" >&2
+  exit 1
+fi
+
+if git -C "$wt_path" merge-base --is-ancestor "$branch" "origin/$base_branch" 2>/dev/null; then
+  # Merged: the PR landed. The worktree is clean and idle, so reclaim it.
+  echo "agent-down: $branch is merged into origin/$base_branch; reclaiming $wt_path" >&2
+  if [[ -n "${TREEHOUSE_DRY_RUN:-}" ]]; then
+    echo "agent-down: (dry run) would run: $TREEHOUSE_BIN destroy $wt_path --include-leased --yes" >&2
+    # Do NOT remove the cached lease: the worktree was not reclaimed, so a
+    # later real run must still be able to find it.
+    exit 0
+  fi
+  if "$TREEHOUSE_BIN" destroy "$wt_path" --include-leased --yes; then
+    rm -f "$lease_file"
+    echo "agent-down: reclaimed $wt_path" >&2
+    exit 0
+  else
+    echo "agent-down: treehouse refused to reclaim $wt_path; keeping lease (inspect with 'treehouse status')" >&2
+    exit 1
+  fi
+fi
+
+# Not merged: the PR is presumably still open, or the branch was never pushed.
+# Keep the lease so a later sweep (or the user) can reclaim it post-merge.
+echo "agent-down: $branch is NOT merged into origin/$base_branch; keeping leased worktree at $wt_path (work preserved)" >&2
+exit 0
