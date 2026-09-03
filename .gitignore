@@ -22,3 +22,6 @@ coverage.out
 
 # Local agent session logs (written by Claude Code hooks)
 /logs/
+
+# Crabbox local capture bundles
+.crabbox/

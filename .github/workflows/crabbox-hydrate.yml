@@ -1,0 +1,64 @@
+name: crabbox-hydrate
+on:
+  workflow_dispatch:
+    inputs:
+      crabbox_id:
+        required: true
+        type: string
+      crabbox_runner_label:
+        required: true
+        type: string
+      crabbox_job:
+        required: false
+        default: "hydrate"
+        type: string
+      crabbox_keep_alive_minutes:
+        required: false
+        default: "0"
+        type: string
+jobs:
+  hydrate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Go
+        # Static SSH hosts have no prebaked toolchain, so download Go from the
+        # version pinned in go.mod into $HOME/go-toolchain (a dedicated dir —
+        # never $HOME/go, which may hold a root-owned module cache) and make it
+        # available to later crabbox run commands via the readiness env file.
+        run: |
+          set -e
+          goversion="$(sed -n 's/^go //p' go.mod | head -1)"
+          [ -n "$goversion" ] || goversion="1.25.5"
+          arch="$(uname -m)"
+          case "$arch" in x86_64) arch=amd64 ;; aarch64|arm64) arch=arm64 ;; esac
+          toolroot="$HOME/go-toolchain"
+          if [ ! -x "$toolroot/go/bin/go" ] || ! "$toolroot/go/bin/go" version | grep -q "go$goversion"; then
+            rm -rf "$toolroot"
+            mkdir -p "$HOME/.cache/go-toolchain"
+            curl -fsSL "https://go.dev/dl/go${goversion}.linux-${arch}.tar.gz" \
+              -o "$HOME/.cache/go-toolchain/go.tgz"
+            mkdir -p "$toolroot"
+            tar -C "$toolroot" -xzf "$HOME/.cache/go-toolchain/go.tgz"
+          fi
+          "$toolroot/go/bin/go" version
+      - name: Write readiness marker
+        env:
+          CRABBOX_ID: ${{ inputs.crabbox_id }}
+          CRABBOX_JOB: ${{ inputs.crabbox_job }}
+        run: |
+          mkdir -p "$HOME/.crabbox/actions"
+          state="$HOME/.crabbox/actions/${CRABBOX_ID}.env"
+          env_file="$HOME/.crabbox/actions/${CRABBOX_ID}.env.sh"
+          # ENV_FILE is sourced into every later `crabbox run` command, so it is
+          # the right place to export the Go toolchain PATH.
+          {
+            echo "export PATH=\"${HOME}/go-toolchain/go/bin:/usr/local/go/bin:\${PATH}\""
+          } > "$env_file"
+          {
+            echo "WORKSPACE=${GITHUB_WORKSPACE}"
+            echo "RUN_ID=${GITHUB_RUN_ID}"
+            echo "JOB=${CRABBOX_JOB}"
+            echo "ENV_FILE=${env_file}"
+            echo "READY_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > "$state"

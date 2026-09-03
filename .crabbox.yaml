@@ -1,0 +1,6 @@
+# Crabbox repo config: hydrates the lease with Go (from this repo's CI setup)
+# before running commands, so `crabbox run -- go test ./...` works on any
+# static SSH host / Daytona workspace without a preinstalled toolchain.
+actions:
+  workflow: .github/workflows/crabbox-hydrate.yml
+  job: hydrate
