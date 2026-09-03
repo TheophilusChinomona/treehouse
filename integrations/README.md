@@ -30,6 +30,25 @@ leaves the worktree parked for post-merge reclamation:
 All three follow the canonical procedure in
 [`AGENT-WORKFLOW.md`](AGENT-WORKFLOW.md). See that file for the exact rules.
 
+## Remote execution with crabbox (throwaway Daytona sandboxes)
+
+Pair an isolated *location* (treehouse worktree) with an isolated *machine*
+(crabbox). Crabbox provisions a throwaway sandbox from a Daytona snapshot,
+syncs the current repo, runs a command remotely, streams output, and deletes
+the box. The repo's `.crabbox.yaml` + `.github/workflows/crabbox-hydrate.yml`
+make `crabbox run -- go test ./...` work against any leased host or sandbox.
+
+Each agent also exposes a `/crabbox daytona <task>` command that runs the task
+in a throwaway Daytona sandbox:
+
+- **Claude Code:** `~/.claude/skills/crabbox/SKILL.md`
+- **Hermes:** `~/.hermes/skills/software-development/crabbox/SKILL.md`
+- **Command Code:** `~/.commandcode/commands/crabbox.md`
+
+Setup notes: the `daytona` provider uses the `crabbox-go` snapshot (Debian +
+Go preinstalled); `DAYTONA_API_KEY` lives in the shell environment. Static SSH
+hosts (e.g. `speccon` over Tailscale) are selected with `--provider ssh`.
+
 ## Why it's safe
 
 The down policy **never auto-returns or deletes a worktree whose commits are
