@@ -15,6 +15,21 @@ two thin scripts add the agent policy around it:
   keeps the lease and reports where the worktree is. It is also safe to run
   standalone, and its merge logic is what a scheduled sweep relies on.
 
+## In-session workflow (the `agent-up` alternative)
+
+The wrappers above launch an agent *from outside* and tear the worktree down on
+agent exit. If instead you want to sit inside an agent session and tell it to
+grab a worktree, the agents each expose a `/treehouse <task>` command that
+provisions a leased worktree, does the work and tests there, opens a PR, and
+leaves the worktree parked for post-merge reclamation:
+
+- **Claude Code:** `~/.claude/skills/treehouse/SKILL.md`
+- **Hermes:** `~/.hermes/skills/software-development/treehouse/SKILL.md`
+- **Command Code:** `~/.commandcode/commands/treehouse.md`
+
+All three follow the canonical procedure in
+[`AGENT-WORKFLOW.md`](AGENT-WORKFLOW.md). See that file for the exact rules.
+
 ## Why it's safe
 
 The down policy **never auto-returns or deletes a worktree whose commits are
